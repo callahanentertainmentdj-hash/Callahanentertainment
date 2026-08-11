@@ -13,11 +13,14 @@ load_dotenv()
 
 IO_API_KEY = os.getenv("INFLATABLE_OFFICE_API_KEY", "").strip()
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
-IO_BASE_URL = os.getenv("IO_BASE_URL", "https://rental.software/api6").rstrip("/")
+IO_BASE_URL = os.getenv(
+    "IO_BASE_URL",
+    "https://rental.software/api6"
+).rstrip("/")
 
 app = FastAPI(
     title="Callahan InflatableOffice Bridge",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 security = HTTPBearer()
@@ -29,6 +32,7 @@ def require_config():
             status_code=500,
             detail="INFLATABLE_OFFICE_API_KEY is not configured"
         )
+
     if not BRIDGE_TOKEN:
         raise HTTPException(
             status_code=500,
@@ -67,7 +71,10 @@ async def io_get(path: str, params: Optional[dict] = None):
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"InflatableOffice connection failed: {exc.__class__.__name__}"
+            detail=(
+                "InflatableOffice connection failed: "
+                f"{exc.__class__.__name__}"
+            )
         )
 
     if response.status_code == 429:
@@ -79,7 +86,10 @@ async def io_get(path: str, params: Optional[dict] = None):
     if response.status_code >= 400:
         raise HTTPException(
             status_code=502,
-            detail=f"InflatableOffice returned HTTP {response.status_code}"
+            detail=(
+                "InflatableOffice returned HTTP "
+                f"{response.status_code}"
+            )
         )
 
     try:
@@ -91,121 +101,148 @@ async def io_get(path: str, params: Optional[dict] = None):
         )
 
 
-def _find_list(data):
-    if isinstance(data, list):
-        return data
+async def io_get_all(path: str, params: Optional[dict] = None, page_size: int = 100):
+    all_items = []
+    offset = 0
 
-    if isinstance(data, dict):
-        for key in ("items", "results", "data", "leads"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
+    while True:
+        page_params = dict(params or {})
+        page_params["offset"] = offset
+        page_params["limit"] = page_size
 
-    return []
+        data = await io_get(path, page_params)
+
+        if isinstance(data, list):
+            all_items.extend(data)
+            break
+
+        if not isinstance(data, dict):
+            break
+
+        items = data.get("items", [])
+        if not isinstance(items, list):
+            break
+
+        all_items.extend(items)
+
+        if len(items) < page_size:
+            break
+
+        offset += page_size
+
+    return all_items
 
 
-def _parse_date(value):
+def parse_io_date(value):
     if not value:
         return None
 
     text = str(value).strip()
-
-    formats = (
-        "%Y-%m-%d",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%m/%d/%Y",
-        "%m/%d/%Y %I:%M %p",
-    )
-
-    for fmt in formats:
-        try:
-            return datetime.strptime(text[:19], fmt).date()
-        except ValueError:
-            pass
 
     try:
         return datetime.fromisoformat(
             text.replace("Z", "+00:00")
         ).date()
     except Exception:
-        return None
+        pass
 
-
-def _lead_date(lead):
-    if not isinstance(lead, dict):
-        return None
-
-    for key in (
-        "eventStart",
-        "event_start",
-        "start",
-        "startDate",
-        "start_date",
-        "date",
-        "eventDate",
-        "event_date",
+    for fmt in (
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y",
+        "%m/%d/%Y %I:%M %p",
     ):
-        if key in lead:
-            parsed = _parse_date(lead.get(key))
-            if parsed:
-                return parsed
-
-    body = lead.get("body")
-    if isinstance(body, dict):
-        return _lead_date(body)
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
 
     return None
 
 
-def _rental_items(lead):
+def is_confirmed_lead(lead):
     if not isinstance(lead, dict):
-        return []
+        return False
 
-    possible = []
+    status = lead.get("status")
 
-    for key in ("rentals", "rentalItems", "rental_items", "items"):
-        value = lead.get(key)
-        if isinstance(value, list):
-            possible.extend(value)
+    if isinstance(status, dict):
+        confirmed_flag = str(
+            status.get("confirmed", "")
+        ).strip().lower()
 
-    body = lead.get("body")
-    if isinstance(body, dict):
-        possible.extend(_rental_items(body))
+        status_name = str(
+            status.get("name", "")
+        ).strip().lower()
 
-    output = []
-
-    for item in possible:
-        if isinstance(item, str):
-            output.append((item, 1))
-            continue
-
-        if not isinstance(item, dict):
-            continue
-
-        name = (
-            item.get("name")
-            or item.get("rentalName")
-            or item.get("rental_name")
-            or item.get("title")
+        return (
+            confirmed_flag in {"1", "true", "yes"}
+            or status_name == "confirmed"
         )
 
-        qty = (
-            item.get("quantity")
-            or item.get("qty")
-            or item.get("count")
-            or 1
-        )
+    status_name = str(
+        lead.get("statusname", "")
+        or lead.get("status_name", "")
+    ).strip().lower()
 
-        if name:
-            try:
-                qty = int(qty)
-            except Exception:
-                qty = 1
+    return status_name == "confirmed"
 
-            output.append((str(name), qty))
 
-    return output
+def is_inflatable_rental(rental):
+    if not isinstance(rental, dict):
+        return False
+
+    name = str(rental.get("ridename", "")).lower()
+    category = str(rental.get("category_name", "")).lower()
+
+    haystack = f"{category} {name}"
+
+    inflatable_words = (
+        "inflatable",
+        "bounce",
+        "bouncer",
+        "moonwalk",
+        "water slide",
+        "waterslide",
+        "dry slide",
+        "obstacle",
+        "combo",
+        "jumper",
+        "sports game",
+        "interactive",
+        "axe throw",
+        "soccer darts",
+        "basketball",
+        "football",
+        "baseball",
+        "frisbee",
+        "tic tac toe",
+    )
+
+    non_inflatable_words = (
+        "tent",
+        "table",
+        "chair",
+        "generator",
+        "concession",
+        "popcorn",
+        "cotton candy",
+        "snow cone",
+        "hot dog",
+        "photo booth",
+        "photobooth",
+        "mini golf",
+        "karaoke",
+        "speaker",
+        "lighting",
+        "foam",
+        "bubble",
+    )
+
+    if any(word in haystack for word in non_inflatable_words):
+        return False
+
+    return any(word in haystack for word in inflatable_words)
 
 
 @app.get("/")
@@ -357,45 +394,95 @@ async def public_weekend_items():
     saturday = today + timedelta(days=days_until_saturday)
     sunday = saturday + timedelta(days=1)
 
-    data = await io_get(
+    lead_summaries = await io_get_all(
         "leads/",
-        {
-            "_body": "true",
-            "offset": 0,
-            "limit": 100
-        }
+        {"_body": "false"}
     )
 
-    lead_list = _find_list(data)
-    totals = Counter()
-    matching_leads = 0
+    weekend_lead_ids = []
 
-    for lead in lead_list:
+    for lead in lead_summaries:
         if not isinstance(lead, dict):
             continue
 
-        event_date = _lead_date(lead)
+        event_date = parse_io_date(
+            lead.get("eventstarttime")
+            or lead.get("fullstart")
+        )
 
-        if event_date not in (saturday, sunday):
+        if event_date in (saturday, sunday):
+            lead_id = lead.get("id")
+            if lead_id:
+                weekend_lead_ids.append(str(lead_id))
+
+    rental_cache = {}
+    totals = Counter()
+    confirmed_lead_count = 0
+
+    for lead_id in weekend_lead_ids:
+        detail = await io_get(
+            f"leads/{lead_id}",
+            {"_body": "true"}
+        )
+
+        if not is_confirmed_lead(detail):
             continue
 
-        matching_leads += 1
+        confirmed_lead_count += 1
 
-        for name, qty in _rental_items(lead):
-            totals[name] += qty
+        selectedrides = detail.get("selectedrides", [])
+        rentalqty = detail.get("rentalqty", {})
+
+        if not isinstance(selectedrides, list):
+            continue
+
+        if not isinstance(rentalqty, dict):
+            rentalqty = {}
+
+        for rental_id in selectedrides:
+            rental_id = str(rental_id)
+
+            if rental_id not in rental_cache:
+                rental_cache[rental_id] = await io_get(
+                    f"rentals/{rental_id}"
+                )
+
+            rental = rental_cache[rental_id]
+
+            if not is_inflatable_rental(rental):
+                continue
+
+            name = (
+                rental.get("ridename")
+                or f"Rental {rental_id}"
+            )
+
+            try:
+                qty = int(
+                    float(rentalqty.get(rental_id, 1))
+                )
+            except Exception:
+                qty = 1
+
+            totals[name] += max(qty, 1)
 
     return {
         "weekend": {
             "saturday": str(saturday),
             "sunday": str(sunday)
         },
-        "leadCount": matching_leads,
+        "status": "confirmed only",
+        "confirmedLeadCount": confirmed_lead_count,
+        "totalInflatables": sum(totals.values()),
         "items": [
             {
                 "name": name,
                 "quantity": quantity
             }
-            for name, quantity in sorted(totals.items())
+            for name, quantity in sorted(
+                totals.items(),
+                key=lambda x: (-x[1], x[0].lower())
+            )
         ]
     }
 
