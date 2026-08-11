@@ -1,156 +1,122 @@
 import os
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Header, Query
-from fastapi.responses import JSONResponse
-from dotenv import load_dotenv
 import httpx
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-load_dotenv()
+app = FastAPI(
+    title="Callahan InflatableOffice Bridge",
+    version="1.1.0"
+)
 
-IO_API_KEY = os.getenv("INFLATABLE_OFFICE_API_KEY", "").strip()
-BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
-IO_BASE_URL = os.getenv("IO_BASE_URL", "https://rental.software/api6").rstrip("/")
+IO_API_KEY = os.getenv("INFLATABLE_OFFICE_API_KEY")
+BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN")
+IO_BASE = "https://rental.software/api6"
 
-app = FastAPI(title="Callahan InflatableOffice Bridge", version="0.1.0")
+security = HTTPBearer()
 
 
-def require_config():
-    if not IO_API_KEY:
-        raise HTTPException(status_code=500, detail="INFLATABLE_OFFICE_API_KEY is not configured")
+def check_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
     if not BRIDGE_TOKEN:
-        raise HTTPException(status_code=500, detail="BRIDGE_TOKEN is not configured")
+        raise HTTPException(
+            status_code=500,
+            detail="BRIDGE_TOKEN is not configured"
+        )
+
+    if credentials.credentials != BRIDGE_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    return True
 
 
-def authorize(authorization: Optional[str]):
-    require_config()
-    expected = f"Bearer {BRIDGE_TOKEN}"
-    if authorization != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+async def io_get(path: str, params: dict | None = None):
+    if not IO_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="INFLATABLE_OFFICE_API_KEY is not configured"
+        )
 
-
-async def io_get(path: str, params: Optional[dict] = None):
-    require_config()
-    params = dict(params or {})
+    params = params or {}
     params["apiKey"] = IO_API_KEY
-    url = f"{IO_BASE_URL}/{path.lstrip('/')}"
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, params=params, headers={"Accept": "application/json"})
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=502, detail=f"InflatableOffice connection failed: {exc.__class__.__name__}")
 
-    if response.status_code == 429:
-        raise HTTPException(status_code=429, detail="InflatableOffice rate limit reached")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            f"{IO_BASE}/{path.lstrip('/')}",
+            params=params
+        )
+
     if response.status_code >= 400:
-        # Never return a requested URL here because it includes the IO API key.
-        raise HTTPException(status_code=502, detail=f"InflatableOffice returned HTTP {response.status_code}")
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=response.text
+        )
 
     try:
         return response.json()
-    except ValueError:
-        raise HTTPException(status_code=502, detail="InflatableOffice returned a non-JSON response")
+    except Exception:
+        return {"raw": response.text}
 
 
 @app.get("/")
-async def root():
-    return {"service": "Callahan InflatableOffice Bridge", "status": "ok", "mode": "read-only"}
+def root():
+    return {
+        "service": "Callahan InflatableOffice Bridge",
+        "status": "running"
+    }
 
 
 @app.get("/health")
-async def health(authorization: Optional[str] = Header(default=None)):
-    authorize(authorization)
-    # Rentals is the endpoint InflatableOffice documents as an API-key test.
-    data = await io_get("rentals", {"limit": 1})
-    return {"bridge": "ok", "inflatableOffice": "ok", "sampleCount": len(data.get("items", [])) if isinstance(data, dict) else None}
+async def health(_: bool = Depends(check_token)):
+    return {
+        "status": "ok",
+        "bridge": "running",
+        "inflatable_office_key_configured": bool(IO_API_KEY)
+    }
+
+
+@app.get("/rentals")
+async def rentals(_: bool = Depends(check_token)):
+    return await io_get("rentals/")
+
+
+@app.get("/workers")
+async def workers(_: bool = Depends(check_token)):
+    return await io_get("workers/")
+
+
+@app.get("/vehicles")
+async def vehicles(_: bool = Depends(check_token)):
+    return await io_get("vehicles/")
+
+
+@app.get("/categories")
+async def categories(_: bool = Depends(check_token)):
+    return await io_get("categories/")
+
+
+@app.get("/locations")
+async def locations(_: bool = Depends(check_token)):
+    return await io_get("locations/")
 
 
 @app.get("/leads")
-async def leads(
-    authorization: Optional[str] = Header(default=None),
-    filter: Optional[str] = Query(default=None),
-    body: bool = Query(default=True),
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=25, ge=1, le=100),
-):
-    authorize(authorization)
-    params = {"_body": "true" if body else "false", "offset": offset, "limit": limit}
-    if filter:
-        params["filter"] = filter
-    return await io_get("leads/", params)
+async def leads(_: bool = Depends(check_token)):
+    return await io_get(
+        "leads/",
+        {"_body": "true"}
+    )
 
 
 @app.get("/leads/{lead_id}")
 async def lead_detail(
-    lead_id: int,
-    authorization: Optional[str] = Header(default=None),
-    body: bool = Query(default=True),
+    lead_id: str,
+    _: bool = Depends(check_token)
 ):
-    authorize(authorization)
-    return await io_get(f"leads/{lead_id}", {"_body": "true" if body else "false"})
-
-
-@app.get("/rentals")
-async def rentals(
-    authorization: Optional[str] = Header(default=None),
-    body: bool = Query(default=False),
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=25, ge=1, le=100),
-):
-    authorize(authorization)
-    return await io_get("rentals", {"_body": "true" if body else "false", "offset": offset, "limit": limit})
-
-
-@app.get("/workers")
-async def workers(
-    authorization: Optional[str] = Header(default=None),
-    approved: bool = Query(default=True),
-    vehicles: bool = Query(default=False),
-    body: bool = Query(default=False),
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=25, ge=1, le=100),
-):
-    authorize(authorization)
-    params = {
-        "_body": "true" if body else "false",
-        "approved": 1 if approved else 0,
-        "vehicle": 1 if vehicles else 0,
-        "offset": offset,
-        "limit": limit,
-    }
-    return await io_get("workers/", params)
-
-
-@app.get("/vehicles")
-async def vehicles(
-    authorization: Optional[str] = Header(default=None),
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=25, ge=1, le=100),
-):
-    authorize(authorization)
-    return await io_get("workers/", {"vehicle": 1, "offset": offset, "limit": limit})
-
-
-@app.get("/categories")
-async def categories(
-    authorization: Optional[str] = Header(default=None),
-    wpid: int = Query(default=0, ge=0),
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=25, ge=1, le=100),
-):
-    authorize(authorization)
-    return await io_get("categories_list/", {"wpid": wpid, "offset": offset, "limit": limit})
-
-
-@app.get("/locations")
-async def locations(
-    authorization: Optional[str] = Header(default=None),
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=25, ge=1, le=100),
-):
-    authorize(authorization)
-    return await io_get("locations/", {"offset": offset, "limit": limit})
-
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await io_get(
+        f"leads/{lead_id}/",
+        {"_body": "true"}
+    )
