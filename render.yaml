@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: callahan-io-bridge
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: INFLATABLE_OFFICE_API_KEY
+        sync: false
+      - key: BRIDGE_TOKEN
+        generateValue: true
+      - key: IO_BASE_URL
+        value: https://rental.software/api6
