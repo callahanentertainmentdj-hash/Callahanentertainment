@@ -205,25 +205,42 @@ def is_inflatable(rental):
     if not isinstance(rental, dict):
         return False
 
-    parts = []
-    for key in ("ridename", "name", "category_name", "category", "type"):
+    wanted_categories = {
+        "bounce house slide combos",
+        "bounce houses",
+        "obstacle courses",
+        "water slides",
+        "games",
+    }
+
+    category_values = []
+
+    for key in ("category_name", "category", "categories"):
         value = rental.get(key)
-        if isinstance(value, dict):
-            value = value.get("name", "")
-        if value:
-            parts.append(str(value).lower())
 
-    text = " ".join(parts)
-    exclude = ("tent", "table", "chair", "generator", "popcorn", "cotton candy", "snow cone", "hot dog",
-               "concession", "photo booth", "photobooth", "mini golf", "karaoke", "speaker", "uplight",
-               "lighting", "foam", "bubble", "dance floor")
-    include = ("inflatable", "bounce", "bouncer", "water slide", "waterslide", "dry slide", "slide",
-               "obstacle", "combo", "moonwalk", "jumper", "interactive", "sports", "axe throw",
-               "soccer darts", "tic tac toe")
+        if isinstance(value, str):
+            category_values.append(value)
 
-    if any(word in text for word in exclude):
-        return False
-    return any(word in text for word in include)
+        elif isinstance(value, dict):
+            name = value.get("name")
+            if name:
+                category_values.append(name)
+
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    category_values.append(item)
+                elif isinstance(item, dict):
+                    name = item.get("name")
+                    if name:
+                        category_values.append(name)
+
+    normalized = {
+        str(category).strip().lower()
+        for category in category_values
+    }
+
+    return bool(normalized & wanted_categories)
 
 
 def parse_requested_date(text):
