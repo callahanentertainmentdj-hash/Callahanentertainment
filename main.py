@@ -26,7 +26,7 @@ except ValueError:
 
 app = FastAPI(
     title="Callahan InflatableOffice Bridge",
-    version="3.4.1"
+    version="3.4.2"
 )
 
 security = HTTPBearer()
@@ -1443,15 +1443,26 @@ def lead_fee_rows(lead):
 def staffing_charge_info(lead):
     """
     Detect explicit PAID staff/attendant charges from IO fee lines.
-    Zero-dollar Staff Costs lines are ignored because InflatableOffice
-    may include them on ordinary events.
+
+    Important Callahan rule:
+    - Zero-dollar Staff Costs lines are ignored.
+    - Timed Delivery/Venue is NOT an attendant/staffing requirement,
+      even though InflatableOffice may classify its fee type as "staff".
     """
     hits = []
+
+    excluded_fee_names = {
+        "timed delivery/venue",
+        "timed delivery venue",
+    }
 
     for fee in lead_fee_rows(lead):
         n = normalize_name(fee["name"])
         t = normalize_name(fee["type"])
         amount = money(fee.get("amount"))
+
+        if n in excluded_fee_names:
+            continue
 
         if (
             amount > 0
@@ -1789,7 +1800,7 @@ async def root():
         "service": "Callahan InflatableOffice Bridge",
         "status": "ok",
         "mode": "read-only",
-        "version": "3.4.1"
+        "version": "3.4.2"
     }
 
 
