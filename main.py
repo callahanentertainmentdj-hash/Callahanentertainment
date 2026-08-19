@@ -11,13 +11,13 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 load_dotenv()
-CONFIRMED_STATUS_ID = os.getenv("CONFIRMED_STATUS_ID", "").strip()
+
 IO_API_KEY = os.getenv("INFLATABLE_OFFICE_API_KEY", "").strip()
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
 IO_BASE_URL = os.getenv("IO_BASE_URL", "https://rental.software/api6").rstrip("/")
 CONFIRMED_STATUS_ID = os.getenv("CONFIRMED_STATUS_ID", "").strip()
 
-app = FastAPI(title="Callahan InflatableOffice Bridge", version="2.0.0")
+app = FastAPI(title="Callahan InflatableOffice Bridge", version="2.1.1")
 security = HTTPBearer()
 
 RENTAL_CACHE_SECONDS = 21600
@@ -205,43 +205,169 @@ def is_inflatable(rental):
     if not isinstance(rental, dict):
         return False
 
-    wanted_categories = {
-        "bounce house slide combos",
-        "bounce houses",
-        "obstacle courses",
-        "water slides",
-        "games",
-    }
-
-    category_values = []
-
-    for key in ("category_name", "category", "categories"):
+    parts = []
+    for key in ("ridename", "name", "category_name", "category", "type"):
         value = rental.get(key)
+        if isinstance(value, dict):
+            value = value.get("name", "")
+        if value:
+            parts.append(str(value).lower())
 
-        if isinstance(value, str):
-            category_values.append(value)
+    text = " ".join(parts)
+    exclude = ("tent", "table", "chair", "generator", "popcorn", "cotton candy", "snow cone", "hot dog",
+               "concession", "photo booth", "photobooth", "mini golf", "karaoke", "speaker", "uplight",
+               "lighting", "foam", "bubble", "dance floor")
+    include = ("inflatable", "bounce", "bouncer", "water slide", "waterslide", "dry slide", "slide",
+               "obstacle", "combo", "moonwalk", "jumper", "interactive", "sports", "axe throw",
+               "soccer darts", "tic tac toe")
 
-        elif isinstance(value, dict):
-            name = value.get("name")
-            if name:
-                category_values.append(name)
+    if any(word in text for word in exclude):
+        return False
+    return any(word in text for word in include)
 
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, str):
-                    category_values.append(item)
-                elif isinstance(item, dict):
-                    name = item.get("name")
-                    if name:
-                        category_values.append(name)
 
-    normalized = {
-        str(category).strip().lower()
-        for category in category_values
+
+def normalize_item_name(name):
+    return " ".join(str(name or "").strip().lower().split())
+
+
+def classify_equipment(name):
+    n = normalize_item_name(name)
+    if "chair" in n:
+        return "chairs"
+    if "table" in n:
+        return "tables"
+    if "tent" in n:
+        return "tents"
+    inflatable_terms = (
+        "bounce", "bouncer", "combo", "slide", "obstacle",
+        "inflatable", "moonwalk", "jumper", "axe throw",
+        "soccer darts", "tic tac toe", "football",
+        "basketball", "baseball", "frisbee"
+    )
+    if any(term in n for term in inflatable_terms):
+        return "inflatables_games"
+    concession_terms = ("popcorn", "cotton candy", "snow cone", "hot dog")
+    if any(term in n for term in concession_terms):
+        return "concessions"
+    if "mini golf" in n or "golf" in n:
+        return "mini_golf"
+    if "foam" in n:
+        return "foam"
+    if "bubble" in n:
+        return "bubbles"
+    if "photo booth" in n or "photobooth" in n:
+        return "photo_booth"
+    if "karaoke" in n:
+        return "karaoke"
+    return "other"
+
+
+def extract_all_rentals_from_lead(lead):
+    if not isinstance(lead, dict):
+        return []
+    selected, qty_map = selected_rentals_from_record(lead)
+    rentals_obj = lead.get("rentals", {})
+    if not isinstance(rentals_obj, dict):
+        rentals_obj = {}
+    output = []
+    for rental_id in selected:
+        rental = rentals_obj.get(str(rental_id), {})
+        name = ""
+        if isinstance(rental, dict):
+            name = rental.get("ridename") or rental.get("name") or rental.get("title") or ""
+        if not name:
+            name = f"Rental {rental_id}"
+        try:
+            qty = int(float(qty_map.get(str(rental_id), 1)))
+        except Exception:
+            qty = 1
+        output.append((str(rental_id), str(name), max(qty, 1)))
+    return output
+
+
+async def build_equipment_summary(start_date, end_date):
+    cache_key = f"equipment:{start_date}:{end_date}"
+    now = time.time()
+    cached = _summary_cache.get(cache_key)
+    if cached and now < cached["expires"]:
+        result = dict(cached["data"])
+        result["cache"] = "hit"
+        return result
+
+    date_filter = f"{start_date.strftime('%Y-%m-%d')} - {end_date.strftime('%Y-%m-%d')}"
+    params = {"_body": "true", "date": date_filter}
+    if CONFIRMED_STATUS_ID:
+        params["status[]"] = CONFIRMED_STATUS_ID
+
+    lead_rows = await io_get_pages("leads/", params, max_pages=3)
+    confirmed_leads = []
+    for lead in lead_rows:
+        if not isinstance(lead, dict):
+            continue
+        event_date = lead_event_date(lead)
+        if event_date and not (start_date <= event_date <= end_date):
+            continue
+        status_check = confirmed_from_record(lead)
+        if status_check is True:
+            confirmed_leads.append(lead)
+            continue
+        if status_check is False:
+            continue
+        detail = await get_confirmed_lead_details(lead)
+        if detail:
+            detail_date = lead_event_date(detail)
+            if not detail_date or start_date <= detail_date <= end_date:
+                confirmed_leads.append(detail)
+
+    group_totals = Counter()
+    item_totals = Counter()
+    group_items = {}
+    for lead in confirmed_leads:
+        for rental_id, name, qty in extract_all_rentals_from_lead(lead):
+            group = classify_equipment(name)
+            group_totals[group] += qty
+            item_totals[name] += qty
+            group_items.setdefault(group, Counter())
+            group_items[group][name] += qty
+
+    groups = {}
+    for group_name, total in sorted(group_totals.items()):
+        groups[group_name] = {
+            "total": total,
+            "items": [
+                {"name": name, "quantity": qty}
+                for name, qty in sorted(group_items[group_name].items(), key=lambda pair: (-pair[1], pair[0].lower()))
+            ]
+        }
+
+    result = {
+        "dateRange": {"start": str(start_date), "end": str(end_date)},
+        "status": "confirmed only",
+        "confirmedLeadCount": len(confirmed_leads),
+        "totals": {
+            "chairs": group_totals.get("chairs", 0),
+            "tables": group_totals.get("tables", 0),
+            "tents": group_totals.get("tents", 0),
+            "inflatablesGames": group_totals.get("inflatables_games", 0),
+            "concessions": group_totals.get("concessions", 0),
+            "miniGolf": group_totals.get("mini_golf", 0),
+            "foam": group_totals.get("foam", 0),
+            "bubbles": group_totals.get("bubbles", 0),
+            "photoBooth": group_totals.get("photo_booth", 0),
+            "karaoke": group_totals.get("karaoke", 0),
+            "other": group_totals.get("other", 0),
+            "allRentalItems": sum(item_totals.values())
+        },
+        "groups": groups,
+        "allItems": [
+            {"name": name, "quantity": qty}
+            for name, qty in sorted(item_totals.items(), key=lambda pair: (-pair[1], pair[0].lower()))
+        ],
+        "cache": "miss"
     }
-
-    return bool(normalized & wanted_categories)
-
+    _summary_cache[cache_key] = {"expires": now + SUMMARY_CACHE_SECONDS, "data": result}
+    return result
 
 def parse_requested_date(text):
     try:
@@ -317,7 +443,7 @@ async def build_item_summary(start_date, end_date):
 
 @app.get("/")
 async def root():
-    return {"service": "Callahan InflatableOffice Bridge", "status": "ok", "mode": "read-only", "version": "2.0.0"}
+    return {"service": "Callahan InflatableOffice Bridge", "status": "ok", "mode": "read-only", "version": "2.1.1"}
 
 
 @app.get("/health")
@@ -365,10 +491,10 @@ async def rentals(
 @app.get("/public/weekend-items")
 async def public_weekend_items():
     today = datetime.now().date()
-    days_until_saturday = (5 - today.weekday()) % 7
-    saturday = today + timedelta(days=days_until_saturday)
-    sunday = saturday + timedelta(days=1)
-    return await build_item_summary(saturday, sunday)
+    days_until_friday = (4 - today.weekday()) % 7
+    friday = today + timedelta(days=days_until_friday)
+    sunday = friday + timedelta(days=2)
+    return await build_item_summary(friday, sunday)
 
 
 @app.get("/public/day-items")
@@ -390,6 +516,35 @@ async def public_range_items(
         raise HTTPException(status_code=400, detail="Public range is limited to 31 days")
     return await build_item_summary(start_date, end_date)
 
+
+
+@app.get("/public/weekend-equipment")
+async def public_weekend_equipment():
+    today = datetime.now().date()
+    days_until_friday = (4 - today.weekday()) % 7
+    friday = today + timedelta(days=days_until_friday)
+    sunday = friday + timedelta(days=2)
+    return await build_equipment_summary(friday, sunday)
+
+
+@app.get("/public/day-equipment")
+async def public_day_equipment(date: str = Query(..., description="YYYY-MM-DD")):
+    requested = parse_requested_date(date)
+    return await build_equipment_summary(requested, requested)
+
+
+@app.get("/public/range-equipment")
+async def public_range_equipment(
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+):
+    start_date = parse_requested_date(start)
+    end_date = parse_requested_date(end)
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="End date must be on or after start date")
+    if (end_date - start_date).days > 31:
+        raise HTTPException(status_code=400, detail="Public range is limited to 31 days")
+    return await build_equipment_summary(start_date, end_date)
 
 @app.post("/admin/clear-cache")
 async def clear_cache(_: bool = Depends(check_token)):
