@@ -16,6 +16,16 @@ IO_API_KEY = os.getenv("INFLATABLE_OFFICE_API_KEY", "").strip()
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
 IO_BASE_URL = os.getenv("IO_BASE_URL", "https://rental.software/api6").rstrip("/")
 CONFIRMED_STATUS_ID = os.getenv("CONFIRMED_STATUS_ID", "226783").strip()
+QUOTE_STATUS_ID = os.getenv("QUOTE_STATUS_ID", "").strip()
+CONTRACTED_STATUS_ID = os.getenv("CONTRACTED_STATUS_ID", "").strip()
+COMPLETE_STATUS_ID = os.getenv("COMPLETE_STATUS_ID", "").strip()
+
+STATUS_IDS = {
+    "confirmed": CONFIRMED_STATUS_ID,
+    "quote": QUOTE_STATUS_ID,
+    "contracted": CONTRACTED_STATUS_ID,
+    "complete": COMPLETE_STATUS_ID,
+}
 
 try:
     LARGE_EVENT_THRESHOLD = float(
@@ -26,7 +36,7 @@ except ValueError:
 
 app = FastAPI(
     title="Callahan InflatableOffice Bridge",
-    version="3.4.2"
+    version="3.5.0"
 )
 
 security = HTTPBearer()
@@ -296,6 +306,79 @@ def lead_event_date(lead):
             return parsed
 
     return None
+
+
+def normalize_status_name(value):
+    text = str(value or "").strip().lower()
+    aliases = {
+        "quotes": "quote",
+        "quoted": "quote",
+        "contract": "contracted",
+        "contracts": "contracted",
+        "completed": "complete",
+        "completion": "complete",
+        "confirmed": "confirmed",
+    }
+    return aliases.get(text, text)
+
+
+def requested_statuses(value):
+    parts = [normalize_status_name(x) for x in str(value or "").split(",")]
+    parts = [x for x in parts if x]
+    allowed = {"confirmed", "quote", "contracted", "complete"}
+    invalid = [x for x in parts if x not in allowed]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported status: " + ", ".join(invalid) +
+                ". Use confirmed, quote, contracted, or complete."
+            )
+        )
+    return list(dict.fromkeys(parts or ["confirmed"]))
+
+
+def status_matches_record(lead, requested):
+    if not isinstance(lead, dict):
+        return False
+
+    requested = normalize_status_name(requested)
+    status = lead.get("status")
+    status_id = str(lead.get("statusid", "") or lead.get("status_id", "")).strip()
+    configured_id = STATUS_IDS.get(requested, "")
+
+    if configured_id and status_id:
+        return status_id == configured_id
+
+    if isinstance(status, dict):
+        name = normalize_status_name(status.get("name", ""))
+        flag_map = {
+            "confirmed": "confirmed",
+            "quote": "newquote",
+            "contracted": "contract",
+            "complete": "complete",
+        }
+        flag = str(status.get(flag_map.get(requested, ""), "")).strip().lower()
+        if flag in {"1", "true", "yes"}:
+            return True
+        if name == requested:
+            return True
+        if requested == "contracted" and name == "contract":
+            return True
+        if requested == "quote" and name in {"quoted", "new quote"}:
+            return True
+        if requested == "complete" and name == "completed":
+            return True
+
+    name = normalize_status_name(lead.get("statusname", "") or lead.get("status_name", ""))
+    return name == requested
+
+
+def lead_status_name(lead):
+    status = lead.get("status") if isinstance(lead, dict) else None
+    if isinstance(status, dict) and status.get("name"):
+        return str(status.get("name"))
+    return str(lead.get("statusname", "") or lead.get("status_name", "")) if isinstance(lead, dict) else ""
 
 
 def confirmed_from_record(lead):
@@ -877,43 +960,60 @@ async def build_inflatable_schedule(search_text, start_date, end_date):
 # CORE REPORT BUILDER
 # ============================================================
 
-async def fetch_confirmed_leads(start_date, end_date):
+async def fetch_leads_by_status(start_date, end_date, statuses):
+    """Fetch leads by one or more business statuses.
+
+    If a status ID is configured, IO filters server-side. Otherwise the bridge
+    fetches the bounded date range once with _body=true and matches the embedded
+    status name/flags. This lets Quote/Contracted/Complete work before their
+    account-specific IDs are configured.
     """
-    One filtered lead-list request in the normal case.
-    _body=true gives us status + selectedrides + rentalqty + embedded rentals.
-    """
-    date_filter = (
-        f"{start_date.strftime('%Y-%m-%d')} - "
-        f"{end_date.strftime('%Y-%m-%d')}"
-    )
+    statuses = requested_statuses(",".join(statuses) if isinstance(statuses, (list, tuple)) else statuses)
+    date_filter = f"{start_date:%Y-%m-%d} - {end_date:%Y-%m-%d}"
 
-    params = {
-        "_body": "true",
-        "date": date_filter,
-        "status[]": CONFIRMED_STATUS_ID,
-    }
+    configured = [STATUS_IDS.get(x, "") for x in statuses]
+    can_filter_server_side = all(configured)
 
-    rows = await io_get_pages(
-        "leads/",
-        params,
-        max_pages=3
-    )
+    rows = []
+    if can_filter_server_side:
+        # Separate calls are deliberate: IO's repeated status[] handling varies
+        # by account/API gateway, while each call remains small and predictable.
+        seen = set()
+        for status_name in statuses:
+            params = {
+                "_body": "true",
+                "date": date_filter,
+                "status[]": STATUS_IDS[status_name],
+            }
+            for lead in await io_get_pages("leads/", params, max_pages=6):
+                lead_id = str(lead.get("id", "")) if isinstance(lead, dict) else ""
+                key = lead_id or id(lead)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(lead)
+    else:
+        rows = await io_get_pages(
+            "leads/",
+            {"_body": "true", "date": date_filter},
+            max_pages=6,
+        )
 
-    confirmed = []
-
+    matched = []
     for lead in rows:
         if not isinstance(lead, dict):
             continue
-
         event_date = lead_event_date(lead)
-
         if event_date and not (start_date <= event_date <= end_date):
             continue
+        if any(status_matches_record(lead, x) for x in statuses):
+            matched.append(lead)
 
-        if confirmed_from_record(lead) is True:
-            confirmed.append(lead)
+    return matched
 
-    return confirmed
+
+async def fetch_confirmed_leads(start_date, end_date):
+    return await fetch_leads_by_status(start_date, end_date, ["confirmed"])
 
 
 async def build_loadout(start_date, end_date):
@@ -1790,6 +1890,95 @@ async def build_staffing_report(start_date, end_date):
     }
 
     return result
+async def build_status_events(status_text, start_date, end_date, q=None):
+    statuses = requested_statuses(status_text)
+    leads = await fetch_leads_by_status(start_date, end_date, statuses)
+    needle = normalize_name(q) if q else ""
+    events = []
+
+    for lead in leads:
+        rentals = extract_rentals_from_lead(lead)
+        item_names = [r["name"] for r in rentals]
+        haystack = normalize_name(" ".join([
+            lead_customer_name(lead),
+            lead_address(lead),
+            str(lead.get("eventname", "") or ""),
+            " ".join(item_names),
+        ]))
+        if needle and needle not in haystack:
+            continue
+
+        cust = lead.get("cust") if isinstance(lead.get("cust"), dict) else {}
+        events.append({
+            "leadId": str(lead.get("id", "")),
+            "status": lead_status_name(lead),
+            "eventDate": str(lead_event_date(lead) or ""),
+            "startTime": format_clock(lead_start_datetime(lead)),
+            "endTime": format_clock(lead_end_datetime(lead)),
+            "customer": lead_customer_name(lead),
+            "email": str(cust.get("email", "") or lead.get("email", "") or ""),
+            "phone": str(cust.get("cellphone", "") or cust.get("homephone", "") or lead.get("cellphone", "") or ""),
+            "address": lead_address(lead),
+            "eventName": str(lead.get("eventname", "") or ""),
+            "eventTotal": round(lead_total(lead), 2),
+            "amountPaid": round(lead_amount_paid(lead), 2),
+            "balanceDue": round(lead_balance_due(lead), 2),
+            "items": rentals,
+            "createdTime": str(lead.get("createtime", "") or ""),
+            "modifiedTime": str(lead.get("modifiedtime", "") or ""),
+        })
+
+    events.sort(key=lambda x: (x["eventDate"] or "9999-12-31", x["customer"].lower()))
+    return {
+        "statuses": statuses,
+        "dateRange": {"start": str(start_date), "end": str(end_date)},
+        "search": q or "",
+        "count": len(events),
+        "events": events,
+    }
+
+
+async def build_status_summary(status_text, start_date, end_date):
+    statuses = requested_statuses(status_text)
+    leads = await fetch_leads_by_status(start_date, end_date, statuses)
+    by_status = {}
+    total_revenue = total_paid = total_balance = 0.0
+
+    for lead in leads:
+        name = lead_status_name(lead) or "Unknown"
+        bucket = by_status.setdefault(name, {
+            "count": 0, "eventTotal": 0.0, "amountPaid": 0.0, "balanceDue": 0.0
+        })
+        total = lead_total(lead)
+        paid = lead_amount_paid(lead)
+        balance = lead_balance_due(lead)
+        bucket["count"] += 1
+        bucket["eventTotal"] += total
+        bucket["amountPaid"] += paid
+        bucket["balanceDue"] += balance
+        total_revenue += total
+        total_paid += paid
+        total_balance += balance
+
+    for bucket in by_status.values():
+        for key in ("eventTotal", "amountPaid", "balanceDue"):
+            bucket[key] = round(bucket[key], 2)
+
+    count = len(leads)
+    return {
+        "statuses": statuses,
+        "dateRange": {"start": str(start_date), "end": str(end_date)},
+        "count": count,
+        "totals": {
+            "eventTotal": round(total_revenue, 2),
+            "amountPaid": round(total_paid, 2),
+            "balanceDue": round(total_balance, 2),
+            "averageEventValue": round(total_revenue / count, 2) if count else 0.0,
+        },
+        "byStatus": by_status,
+    }
+
+
 # ============================================================
 # ROUTES
 # ============================================================
@@ -1800,7 +1989,7 @@ async def root():
         "service": "Callahan InflatableOffice Bridge",
         "status": "ok",
         "mode": "read-only",
-        "version": "3.4.2"
+        "version": "3.5.0"
     }
 
 
@@ -1815,7 +2004,12 @@ async def health(_: bool = Depends(check_token)):
     return {
         "bridge": "ok",
         "inflatableOffice": "ok",
-        "confirmedStatusId": CONFIRMED_STATUS_ID,
+        "statusIds": {
+            "confirmed": CONFIRMED_STATUS_ID,
+            "quote": QUOTE_STATUS_ID or None,
+            "contracted": CONTRACTED_STATUS_ID or None,
+            "complete": COMPLETE_STATUS_ID or None,
+        },
         "sampleReceived": bool(extract_items(data))
     }
 
@@ -1871,6 +2065,39 @@ async def rentals(
             "limit": limit
         }
     )
+
+
+@app.get("/status-events")
+async def status_events(
+    status: str = Query(default="confirmed", description="confirmed, quote, contracted, complete; comma-separated allowed"),
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    q: Optional[str] = Query(default=None, description="Optional customer, address, event, or rental/item text"),
+    _: bool = Depends(check_token),
+):
+    start_date = parse_requested_date(start)
+    end_date = parse_requested_date(end)
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="End date must be on or after start date")
+    if (end_date - start_date).days > 730:
+        raise HTTPException(status_code=400, detail="Status event range is limited to 730 days")
+    return await build_status_events(status, start_date, end_date, q=q)
+
+
+@app.get("/status-summary")
+async def status_summary(
+    status: str = Query(default="confirmed", description="confirmed, quote, contracted, complete; comma-separated allowed"),
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    _: bool = Depends(check_token),
+):
+    start_date = parse_requested_date(start)
+    end_date = parse_requested_date(end)
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="End date must be on or after start date")
+    if (end_date - start_date).days > 730:
+        raise HTTPException(status_code=400, detail="Status summary range is limited to 730 days")
+    return await build_status_summary(status, start_date, end_date)
 
 
 @app.get("/weekend-collections")
