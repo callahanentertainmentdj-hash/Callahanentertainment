@@ -19,7 +19,7 @@ CONFIRMED_STATUS_ID = os.getenv("CONFIRMED_STATUS_ID", "226783").strip()
 
 app = FastAPI(
     title="Callahan InflatableOffice Bridge",
-    version="3.1.0"
+    version="3.2.0"
 )
 
 security = HTTPBearer()
@@ -554,6 +554,65 @@ async def fetch_future_confirmed_leads(start_date, end_date):
     return await fetch_confirmed_leads(start_date, end_date)
 
 
+def cleaning_priority(last_use_date, next_use_date):
+    """
+    Priority rules:
+      URGENT  = same-day / next-day turnaround
+      HIGH    = next use within 3 days
+      SOON    = next use within 7 days
+      NORMAL  = next use within 14 days
+      LOW     = next use more than 14 days away
+      NO RUSH = no confirmed use in the lookahead window
+    """
+    if not last_use_date:
+        return {
+            "priority": "NO RUSH",
+            "daysUntilNextUse": None,
+            "reason": "No last-use date available."
+        }
+
+    if not next_use_date:
+        return {
+            "priority": "NO RUSH",
+            "daysUntilNextUse": None,
+            "reason": "No confirmed future use in the lookahead window."
+        }
+
+    try:
+        last_date = datetime.strptime(last_use_date, "%Y-%m-%d").date()
+        next_date = datetime.strptime(next_use_date, "%Y-%m-%d").date()
+    except ValueError:
+        return {
+            "priority": "NO RUSH",
+            "daysUntilNextUse": None,
+            "reason": "Unable to calculate dates."
+        }
+
+    gap = (next_date - last_date).days
+
+    if gap <= 1:
+        priority = "URGENT"
+        reason = "Same-day or next-day turnaround."
+    elif gap <= 3:
+        priority = "HIGH"
+        reason = f"Next confirmed use is in {gap} days."
+    elif gap <= 7:
+        priority = "SOON"
+        reason = f"Next confirmed use is in {gap} days."
+    elif gap <= 14:
+        priority = "NORMAL"
+        reason = f"Next confirmed use is in {gap} days."
+    else:
+        priority = "LOW"
+        reason = f"Next confirmed use is in {gap} days."
+
+    return {
+        "priority": priority,
+        "daysUntilNextUse": gap,
+        "reason": reason
+    }
+
+
 async def build_cleaning_plan(start_date, end_date, lookahead_days=60):
     """
     Cleaning/turnover plan:
@@ -605,6 +664,8 @@ async def build_cleaning_plan(start_date, end_date, lookahead_days=60):
                 "name": record["name"],
                 "ownedQuantity": owned_qty,
                 "turnover": turnover_type,
+                "priority": "URGENT",
+                "priorityReason": "Booked on multiple days within the same weekend.",
                 "dates": [
                     {
                         "date": date_key,
@@ -625,13 +686,22 @@ async def build_cleaning_plan(start_date, end_date, lookahead_days=60):
             next_date = None
             next_qty = 0
 
+        last_weekend_use = max(dates) if dates else None
+        priority_info = cleaning_priority(
+            last_weekend_use,
+            next_date
+        )
+
         next_use.append({
             "rentalId": rid,
             "name": record["name"],
-            "lastWeekendUse": max(dates) if dates else None,
+            "lastWeekendUse": last_weekend_use,
             "nextConfirmedUse": next_date,
             "nextQuantity": next_qty,
             "lookaheadDays": lookahead_days,
+            "cleaningPriority": priority_info["priority"],
+            "daysUntilNextUse": priority_info["daysUntilNextUse"],
+            "priorityReason": priority_info["reason"],
         })
 
     repeat_this_weekend.sort(
@@ -641,12 +711,27 @@ async def build_cleaning_plan(start_date, end_date, lookahead_days=60):
         )
     )
 
+    priority_order = {
+        "URGENT": 0,
+        "HIGH": 1,
+        "SOON": 2,
+        "NORMAL": 3,
+        "LOW": 4,
+        "NO RUSH": 5,
+    }
+
     next_use.sort(
         key=lambda x: (
+            priority_order.get(x["cleaningPriority"], 99),
             x["nextConfirmedUse"] is None,
             x["nextConfirmedUse"] or "9999-12-31",
             x["name"].lower()
         )
+    )
+
+    priority_counts = Counter(
+        item["cleaningPriority"]
+        for item in next_use
     )
 
     result = {
@@ -656,6 +741,14 @@ async def build_cleaning_plan(start_date, end_date, lookahead_days=60):
         },
         "status": "confirmed only",
         "weekendConfirmedLeadCount": len(weekend_leads),
+        "cleaningPrioritySummary": {
+            "URGENT": priority_counts.get("URGENT", 0) + len(repeat_this_weekend),
+            "HIGH": priority_counts.get("HIGH", 0),
+            "SOON": priority_counts.get("SOON", 0),
+            "NORMAL": priority_counts.get("NORMAL", 0),
+            "LOW": priority_counts.get("LOW", 0),
+            "NO RUSH": priority_counts.get("NO RUSH", 0),
+        },
         "repeatInflatablesThisWeekend": repeat_this_weekend,
         "nextUseAfterWeekend": next_use,
         "notes": {
@@ -667,7 +760,15 @@ async def build_cleaning_plan(start_date, end_date, lookahead_days=60):
                 "Inflatable is booked on multiple weekend dates, but "
                 "InflatableOffice reports multiple units or no owned quantity. "
                 "A specific physical unit assignment cannot be proven from this data."
-            )
+            ),
+            "priorityLegend": {
+                "URGENT": "Same-weekend turnover or next use within 1 day.",
+                "HIGH": "Next confirmed use within 3 days.",
+                "SOON": "Next confirmed use within 7 days.",
+                "NORMAL": "Next confirmed use within 14 days.",
+                "LOW": "Next confirmed use more than 14 days away.",
+                "NO RUSH": "No confirmed future use in the selected lookahead window."
+            }
         },
         "cache": "miss"
     }
@@ -1057,7 +1158,7 @@ async def root():
         "service": "Callahan InflatableOffice Bridge",
         "status": "ok",
         "mode": "read-only",
-        "version": "3.1.0"
+        "version": "3.2.0"
     }
 
 
