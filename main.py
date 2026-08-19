@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 load_dotenv()
-
+CONFIRMED_STATUS_ID = os.getenv("CONFIRMED_STATUS_ID", "").strip()
 IO_API_KEY = os.getenv("INFLATABLE_OFFICE_API_KEY", "").strip()
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
 IO_BASE_URL = os.getenv("IO_BASE_URL", "https://rental.software/api6").rstrip("/")
