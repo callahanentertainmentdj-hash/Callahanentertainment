@@ -1,42 +1,111 @@
-# Callahan InflatableOffice Bridge
+# Callahan Entertainment AI Hub
 
-Small read-only FastAPI bridge between ChatGPT/other clients and InflatableOffice API v6.
+FastAPI bridge for Callahan Entertainment. It keeps the existing read-only InflatableOffice operational endpoints and adds protected Google marketing endpoints for Search Console, GA4, Google Ads, and Google Business Profile reviews.
 
 ## Security
-- Rotate the InflatableOffice API key that was pasted into chat before deployment.
-- Put the new key only in the host's environment-variable/secret settings.
-- Do not commit `.env` to GitHub.
-- Keep the InflatableOffice API token read-only for Phase 1.
-- Every bridge data endpoint requires `Authorization: Bearer <BRIDGE_TOKEN>`.
+- Keep all API keys, OAuth secrets, refresh tokens, and the bridge token in Render environment variables only.
+- Do not commit a real `.env` file.
+- Protected endpoints require `Authorization: Bearer <BRIDGE_TOKEN>`.
+- InflatableOffice access remains read-only.
 
-## Local run
-1. Copy `.env.example` to `.env` and fill in both secrets.
-2. `pip install -r requirements.txt`
-3. `uvicorn main:app --reload`
-4. Open `http://127.0.0.1:8000/docs`
+## Render
+Render starts the application with:
 
-## Render deployment
-1. Create a private GitHub repository and upload these files.
-2. In Render choose **New > Blueprint** and connect the repo. `render.yaml` configures the service.
-3. Set `INFLATABLE_OFFICE_API_KEY` to the newly rotated IO token.
-4. Render auto-generates `BRIDGE_TOKEN`; copy it from the service Environment page for your client configuration.
-5. Deploy.
-6. Test `/health` with the Authorization header.
-
-Example:
 ```bash
-curl https://YOUR-SERVICE.onrender.com/health \
-  -H "Authorization: Bearer YOUR_BRIDGE_TOKEN"
+uvicorn app:app --host 0.0.0.0 --port $PORT
 ```
 
-## Endpoints
-- `GET /health`
-- `GET /leads?limit=25&body=true`
-- `GET /leads/{lead_id}?body=true`
-- `GET /rentals`
-- `GET /workers`
-- `GET /vehicles`
-- `GET /categories`
-- `GET /locations`
+The public API documentation is available at `/docs` after deployment.
 
-This bridge makes GET requests only. It contains no POST/PATCH/DELETE route for InflatableOffice.
+## InflatableOffice endpoints
+Important operational endpoints include:
+- `GET /health`
+- `GET /leads`
+- `GET /leads/{lead_id}`
+- `GET /rentals`
+- `GET /status-events`
+- `GET /status-summary`
+- `GET /weekend-collections`
+- `GET /collections-range`
+- `GET /staffing`
+- `GET /staffing-range`
+- `GET /weekend-operations`
+- `GET /public/weekend-loadout`
+- `GET /public/day-loadout`
+- `GET /public/range-loadout`
+- `GET /public/weekend-cleaning`
+- `GET /public/inflatable-next-use`
+- `GET /public/schedule`
+- `GET /public/schedule-range`
+
+## Google connection
+The OAuth starter is:
+- `GET /google/oauth/start`
+
+The OAuth callback is:
+- `GET /google/oauth/callback`
+
+After the refresh token is stored in Render, verify the connection with:
+- `GET /google/status`
+
+## Search Console
+- `GET /google/search-console/sites`
+- `GET /google/search-console/performance?days=28&dimensions=query`
+- `GET /google/search-console/performance?days=28&dimensions=page`
+- `GET /google/search-console/performance?days=28&dimensions=query,device`
+- `GET /google/search-console/summary?days=28`
+
+The performance endpoint supports these dimensions: `query`, `page`, `country`, `device`, `date`, and `searchAppearance`.
+
+## Google Analytics 4
+- `GET /google/analytics/overview?days=28`
+- `GET /google/analytics/report?days=28&dimensions=sessionDefaultChannelGroup&metrics=sessions,totalUsers,newUsers,keyEvents`
+
+The custom report endpoint passes supported GA4 dimension and metric names through to the Google Analytics Data API, making it possible to build more specific reports without changing Python code.
+
+## Google Ads
+- `GET /google/ads/customers`
+- `GET /google/ads/campaigns?days=28`
+- `GET /google/ads/search-terms?days=28`
+- `GET /google/ads/keywords?days=28`
+
+The Google Ads API version is controlled with `GOOGLE_ADS_API_VERSION` in Render rather than being permanently hard-coded into every endpoint.
+
+## Google Business Profile
+- `GET /google/business/accounts`
+- `GET /google/business/locations`
+- `GET /google/reviews`
+
+## Combined marketing query
+- `GET /google/marketing-summary?days=28`
+
+This returns Search Console, GA4, Google Ads, and review data in a single protected request. Each source reports its own error so one unavailable Google product does not prevent the other sources from returning.
+
+## Render environment variables
+InflatableOffice/status:
+- `INFLATABLE_OFFICE_API_KEY`
+- `BRIDGE_TOKEN`
+- `IO_BASE_URL`
+- `CONFIRMED_STATUS_ID`
+- `QUOTE_STATUS_ID`
+- `CONTRACTED_STATUS_ID`
+- `COMPLETE_STATUS_ID`
+
+Google OAuth:
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REFRESH_TOKEN`
+- `GOOGLE_REDIRECT_URI`
+- `GOOGLE_OAUTH_STATE_SECRET`
+
+Google services:
+- `GA4_PROPERTY_ID`
+- `SEARCH_CONSOLE_SITE_URL`
+- `GOOGLE_ADS_CUSTOMER_ID`
+- `GOOGLE_ADS_LOGIN_CUSTOMER_ID`
+- `GOOGLE_ADS_DEVELOPER_TOKEN`
+- `GOOGLE_ADS_API_VERSION`
+- `GOOGLE_BUSINESS_ACCOUNT_ID`
+- `GOOGLE_BUSINESS_LOCATION_ID`
+
+Do not put live values into GitHub. Configure them in Render.
