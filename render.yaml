@@ -8,6 +8,40 @@ services:
       - key: INFLATABLE_OFFICE_API_KEY
         sync: false
       - key: BRIDGE_TOKEN
-        generateValue: true
+        sync: false
       - key: IO_BASE_URL
         value: https://rental.software/api6
+      - key: CONFIRMED_STATUS_ID
+        value: "226783"
+      - key: QUOTE_STATUS_ID
+        sync: false
+      - key: CONTRACTED_STATUS_ID
+        sync: false
+      - key: COMPLETE_STATUS_ID
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REFRESH_TOKEN
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: https://callahanentertainment.onrender.com/google/oauth/callback
+      - key: GOOGLE_OAUTH_STATE_SECRET
+        sync: false
+      - key: GA4_PROPERTY_ID
+        sync: false
+      - key: SEARCH_CONSOLE_SITE_URL
+        sync: false
+      - key: GOOGLE_ADS_CUSTOMER_ID
+        sync: false
+      - key: GOOGLE_ADS_LOGIN_CUSTOMER_ID
+        sync: false
+      - key: GOOGLE_ADS_DEVELOPER_TOKEN
+        sync: false
+      - key: GOOGLE_ADS_API_VERSION
+        value: v25
+      - key: GOOGLE_BUSINESS_ACCOUNT_ID
+        sync: false
+      - key: GOOGLE_BUSINESS_LOCATION_ID
+        sync: false
