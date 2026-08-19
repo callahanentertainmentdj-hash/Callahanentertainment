@@ -17,9 +17,16 @@ BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
 IO_BASE_URL = os.getenv("IO_BASE_URL", "https://rental.software/api6").rstrip("/")
 CONFIRMED_STATUS_ID = os.getenv("CONFIRMED_STATUS_ID", "226783").strip()
 
+try:
+    LARGE_EVENT_THRESHOLD = float(
+        os.getenv("LARGE_EVENT_THRESHOLD", "1000")
+    )
+except ValueError:
+    LARGE_EVENT_THRESHOLD = 1000.0
+
 app = FastAPI(
     title="Callahan InflatableOffice Bridge",
-    version="3.3.0"
+    version="3.4.0"
 )
 
 security = HTTPBearer()
@@ -1325,6 +1332,447 @@ async def build_schedule_search(
 
     return result
 
+
+# ============================================================
+# COLLECTIONS + STAFFING HELPERS
+# ============================================================
+
+ATTENDED_SERVICE_TERMS = (
+    "foam party w/ music",
+    "foam party with music",
+    "interactive bubble party",
+    "bubble party",
+    "jurassic adventure",
+    "photo booth",
+    "photobooth",
+)
+
+NON_ATTENDED_FOAM_TERMS = (
+    "foam party machine rental only",
+    "foam machine rental only",
+)
+
+
+def money(value):
+    try:
+        return round(float(value or 0), 2)
+    except Exception:
+        return 0.0
+
+
+def lead_total(lead):
+    if not isinstance(lead, dict):
+        return 0.0
+
+    # IO provides both total and subtotal; total is the correct first choice.
+    return money(
+        lead.get("total")
+        if lead.get("total") not in (None, "")
+        else lead.get("subtotal")
+    )
+
+
+def lead_amount_paid(lead):
+    if not isinstance(lead, dict):
+        return 0.0
+
+    # Prefer the fully-calculated totalamountpaid field when available.
+    value = lead.get("totalamountpaid")
+
+    if value not in (None, ""):
+        return money(value)
+
+    return money(lead.get("amountpaid"))
+
+
+def lead_balance_due(lead):
+    if not isinstance(lead, dict):
+        return 0.0
+
+    # IO exposes balancedue directly in _body=true lead responses.
+    value = lead.get("balancedue")
+
+    if value not in (None, ""):
+        return max(money(value), 0.0)
+
+    # Safe fallback only if balancedue is missing.
+    return max(
+        round(lead_total(lead) - lead_amount_paid(lead), 2),
+        0.0
+    )
+
+
+def lead_fee_rows(lead):
+    """
+    Normalize IO's parallel fee arrays into readable rows.
+    """
+    if not isinstance(lead, dict):
+        return []
+
+    names = lead.get("feename", [])
+    prices = lead.get("feeprice", [])
+    types = lead.get("feetype", [])
+
+    if not isinstance(names, list):
+        return []
+
+    if not isinstance(prices, list):
+        prices = []
+
+    if not isinstance(types, list):
+        types = []
+
+    rows = []
+
+    for i, name in enumerate(names):
+        if not name:
+            continue
+
+        price = money(prices[i]) if i < len(prices) else 0.0
+        fee_type = str(types[i] or "") if i < len(types) else ""
+
+        rows.append({
+            "name": str(name),
+            "amount": price,
+            "type": fee_type,
+        })
+
+    return rows
+
+
+def staffing_charge_info(lead):
+    """
+    Detect explicit staff/attendant charges from IO fee lines.
+    """
+    hits = []
+
+    for fee in lead_fee_rows(lead):
+        n = normalize_name(fee["name"])
+        t = normalize_name(fee["type"])
+
+        if (
+            "staff" in n
+            or "attendant" in n
+            or t == "staff"
+        ):
+            hits.append(fee)
+
+    return hits
+
+
+def attended_rental_reasons(lead):
+    """
+    Rental names that automatically require an attendant.
+    Machine-only foam is explicitly excluded unless a staff fee is present.
+    """
+    reasons = []
+
+    for row in extract_rentals_from_lead(lead):
+        name = row["name"]
+        normalized = normalize_name(name)
+
+        if any(term in normalized for term in NON_ATTENDED_FOAM_TERMS):
+            continue
+
+        if any(term in normalized for term in ATTENDED_SERVICE_TERMS):
+            reasons.append({
+                "type": "attended_service",
+                "rentalName": name,
+                "quantity": row["quantity"],
+            })
+
+    return reasons
+
+
+def lead_event_item_count(lead):
+    return sum(
+        row["quantity"]
+        for row in extract_rentals_from_lead(lead)
+    )
+
+
+def staffing_assessment(lead):
+    staff_fees = staffing_charge_info(lead)
+    attended = attended_rental_reasons(lead)
+
+    reasons = []
+
+    if staff_fees:
+        reasons.append({
+            "type": "staffing_charge",
+            "fees": staff_fees,
+            "totalStaffingCharge": round(
+                sum(f["amount"] for f in staff_fees),
+                2
+            )
+        })
+
+    reasons.extend(attended)
+
+    total = lead_total(lead)
+    item_count = lead_event_item_count(lead)
+    large_event = total >= LARGE_EVENT_THRESHOLD
+
+    # Large events are flagged for review, but do not automatically
+    # become "staff required" without one of the user's explicit rules.
+    return {
+        "staffRequired": bool(staff_fees or attended),
+        "staffingReasons": reasons,
+        "staffingCharge": round(
+            sum(f["amount"] for f in staff_fees),
+            2
+        ),
+        "largeEventReview": large_event,
+        "largeEventThreshold": LARGE_EVENT_THRESHOLD,
+        "eventTotal": total,
+        "bookedItemQuantity": item_count,
+    }
+
+
+def compact_event_row(lead):
+    start_dt = lead_start_datetime(lead)
+    end_dt = lead_end_datetime(lead)
+
+    rentals = [
+        {
+            "name": row["name"],
+            "quantity": row["quantity"]
+        }
+        for row in extract_rentals_from_lead(lead)
+    ]
+
+    return {
+        "leadId": str(lead.get("id", "")),
+        "date": (
+            str(start_dt.date())
+            if start_dt
+            else str(lead_event_date(lead) or "")
+        ),
+        "startTime": format_clock(start_dt),
+        "endTime": format_clock(end_dt),
+        "customer": lead_customer_name(lead),
+        "address": lead_address(lead),
+        "deliveryType": str(
+            lead.get("deliverytype", "") or ""
+        ).strip(),
+        "rentals": rentals,
+    }
+
+
+async def build_collections_report(start_date, end_date):
+    cache_key = f"collections:{start_date}:{end_date}"
+    now = time.time()
+
+    cached = _summary_cache.get(cache_key)
+    if cached and now < cached["expires"]:
+        result = dict(cached["data"])
+        result["cache"] = "hit"
+        return result
+
+    leads = await fetch_confirmed_leads(start_date, end_date)
+
+    events = []
+    total_contracts = 0.0
+    total_paid = 0.0
+    total_balance = 0.0
+
+    for lead in leads:
+        total = lead_total(lead)
+        paid = lead_amount_paid(lead)
+        balance = lead_balance_due(lead)
+
+        total_contracts += total
+        total_paid += paid
+        total_balance += balance
+
+        row = compact_event_row(lead)
+        row.update({
+            "eventTotal": round(total, 2),
+            "amountPaid": round(paid, 2),
+            "balanceDue": round(balance, 2),
+            "paidInFull": balance <= 0.005,
+        })
+        events.append(row)
+
+    events.sort(
+        key=lambda x: (
+            x["date"],
+            x["startTime"] or "",
+            x["customer"].lower(),
+        )
+    )
+
+    outstanding = [
+        event
+        for event in events
+        if event["balanceDue"] > 0.005
+    ]
+
+    result = {
+        "dateRange": {
+            "start": str(start_date),
+            "end": str(end_date)
+        },
+        "status": "confirmed only",
+        "confirmedEventCount": len(leads),
+        "financialSummary": {
+            "contractedRevenue": round(total_contracts, 2),
+            "alreadyPaid": round(total_paid, 2),
+            "outstandingToCollect": round(total_balance, 2),
+            "eventsWithBalanceDue": len(outstanding),
+            "eventsPaidInFull": len(events) - len(outstanding),
+        },
+        "outstandingEvents": outstanding,
+        "allEvents": events,
+        "cache": "miss",
+    }
+
+    _summary_cache[cache_key] = {
+        "expires": now + SUMMARY_CACHE_SECONDS,
+        "data": result,
+    }
+
+    return result
+
+
+async def build_staffing_report(start_date, end_date):
+    cache_key = f"staffing:{start_date}:{end_date}"
+    now = time.time()
+
+    cached = _summary_cache.get(cache_key)
+    if cached and now < cached["expires"]:
+        result = dict(cached["data"])
+        result["cache"] = "hit"
+        return result
+
+    leads = await fetch_confirmed_leads(start_date, end_date)
+
+    required = []
+    large_review = []
+
+    for lead in leads:
+        assessment = staffing_assessment(lead)
+        row = compact_event_row(lead)
+        row.update(assessment)
+
+        if assessment["staffRequired"]:
+            required.append(row)
+
+        if assessment["largeEventReview"]:
+            large_review.append(row)
+
+    required.sort(
+        key=lambda x: (
+            x["date"],
+            x["startTime"] or "",
+            x["customer"].lower(),
+        )
+    )
+
+    large_review.sort(
+        key=lambda x: (
+            x["date"],
+            -(x["eventTotal"] or 0),
+        )
+    )
+
+    # Basic overlap detection for attended events.
+    overlaps = []
+
+    for i, first in enumerate(required):
+        first_start = None
+        first_end = None
+
+        try:
+            first_start = datetime.strptime(
+                f'{first["date"]} {first["startTime"]}',
+                "%Y-%m-%d %I:%M %p"
+            ) if first["startTime"] else None
+
+            first_end = datetime.strptime(
+                f'{first["date"]} {first["endTime"]}',
+                "%Y-%m-%d %I:%M %p"
+            ) if first["endTime"] else None
+        except Exception:
+            pass
+
+        if not first_start or not first_end:
+            continue
+
+        for second in required[i + 1:]:
+            if second["date"] != first["date"]:
+                continue
+
+            try:
+                second_start = datetime.strptime(
+                    f'{second["date"]} {second["startTime"]}',
+                    "%Y-%m-%d %I:%M %p"
+                ) if second["startTime"] else None
+
+                second_end = datetime.strptime(
+                    f'{second["date"]} {second["endTime"]}',
+                    "%Y-%m-%d %I:%M %p"
+                ) if second["endTime"] else None
+            except Exception:
+                second_start = None
+                second_end = None
+
+            if not second_start or not second_end:
+                continue
+
+            if first_start < second_end and second_start < first_end:
+                overlaps.append({
+                    "date": first["date"],
+                    "event1": {
+                        "leadId": first["leadId"],
+                        "customer": first["customer"],
+                        "time": f'{first["startTime"]} - {first["endTime"]}',
+                        "address": first["address"],
+                    },
+                    "event2": {
+                        "leadId": second["leadId"],
+                        "customer": second["customer"],
+                        "time": f'{second["startTime"]} - {second["endTime"]}',
+                        "address": second["address"],
+                    },
+                    "warning": "Attended events overlap and may require separate staff."
+                })
+
+    result = {
+        "dateRange": {
+            "start": str(start_date),
+            "end": str(end_date)
+        },
+        "status": "confirmed only",
+        "confirmedEventCount": len(leads),
+        "staffRequiredCount": len(required),
+        "staffRequiredEvents": required,
+        "largeEventReviewCount": len(large_review),
+        "largeEventsForReview": large_review,
+        "overlapWarnings": overlaps,
+        "rules": {
+            "automaticStaffingTriggers": [
+                "Any staffing or attendant charge",
+                "Foam Party W/ Music",
+                "Bubble Party",
+                "Jurassic Adventure",
+                "Photo Booth",
+            ],
+            "machineOnlyFoam": (
+                "Foam machine rental only does not automatically require "
+                "an attendant unless a staffing charge is present."
+            ),
+            "largeEventReviewThreshold": LARGE_EVENT_THRESHOLD,
+        },
+        "cache": "miss",
+    }
+
+    _summary_cache[cache_key] = {
+        "expires": now + SUMMARY_CACHE_SECONDS,
+        "data": result,
+    }
+
+    return result
 # ============================================================
 # ROUTES
 # ============================================================
@@ -1335,7 +1783,7 @@ async def root():
         "service": "Callahan InflatableOffice Bridge",
         "status": "ok",
         "mode": "read-only",
-        "version": "3.3.0"
+        "version": "3.4.0"
     }
 
 
@@ -1406,6 +1854,120 @@ async def rentals(
             "limit": limit
         }
     )
+
+
+@app.get("/weekend-collections")
+async def weekend_collections(
+    _: bool = Depends(check_token)
+):
+    """
+    Protected financial report for Friday-Sunday.
+    """
+    today = datetime.now().date()
+    days_until_friday = (4 - today.weekday()) % 7
+    friday = today + timedelta(days=days_until_friday)
+    sunday = friday + timedelta(days=2)
+
+    return await build_collections_report(friday, sunday)
+
+
+@app.get("/collections-range")
+async def collections_range(
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    _: bool = Depends(check_token),
+):
+    start_date = parse_requested_date(start)
+    end_date = parse_requested_date(end)
+
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="End date must be on or after start date"
+        )
+
+    if (end_date - start_date).days > 31:
+        raise HTTPException(
+            status_code=400,
+            detail="Collections range is limited to 31 days"
+        )
+
+    return await build_collections_report(
+        start_date,
+        end_date
+    )
+
+
+@app.get("/staffing")
+async def staffing(
+    days: int = Query(default=30, ge=1, le=180),
+    _: bool = Depends(check_token),
+):
+    start_date = datetime.now().date()
+    end_date = start_date + timedelta(days=days)
+
+    return await build_staffing_report(
+        start_date,
+        end_date
+    )
+
+
+@app.get("/staffing-range")
+async def staffing_range(
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+    _: bool = Depends(check_token),
+):
+    start_date = parse_requested_date(start)
+    end_date = parse_requested_date(end)
+
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="End date must be on or after start date"
+        )
+
+    if (end_date - start_date).days > 180:
+        raise HTTPException(
+            status_code=400,
+            detail="Staffing range is limited to 180 days"
+        )
+
+    return await build_staffing_report(
+        start_date,
+        end_date
+    )
+
+
+@app.get("/weekend-operations")
+async def weekend_operations(
+    _: bool = Depends(check_token)
+):
+    """
+    Protected combined weekend financial + staffing report.
+    """
+    today = datetime.now().date()
+    days_until_friday = (4 - today.weekday()) % 7
+    friday = today + timedelta(days=days_until_friday)
+    sunday = friday + timedelta(days=2)
+
+    collections = await build_collections_report(
+        friday,
+        sunday
+    )
+    staffing = await build_staffing_report(
+        friday,
+        sunday
+    )
+
+    return {
+        "dateRange": {
+            "start": str(friday),
+            "end": str(sunday)
+        },
+        "collections": collections,
+        "staffing": staffing,
+    }
 
 
 @app.get("/public/weekend-loadout")
