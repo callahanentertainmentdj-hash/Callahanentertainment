@@ -19,7 +19,7 @@ CONFIRMED_STATUS_ID = os.getenv("CONFIRMED_STATUS_ID", "226783").strip()
 
 app = FastAPI(
     title="Callahan InflatableOffice Bridge",
-    version="3.0.0"
+    version="3.1.0"
 )
 
 security = HTTPBearer()
@@ -120,6 +120,10 @@ PACKAGE_COMPONENTS = {
         # Generic label because the package lets the customer select a combo/slide.
         # If IO exposes the chosen option separately, it will already appear as its
         # own rental line and should not be duplicated here.
+    },
+    "tables and chairs small party package": {
+        "6 Ft Folding Table Grey": 2,
+        "White Folding Chair": 16,
     },
 }
 
@@ -484,6 +488,284 @@ def add_item_to_counters(
 
 
 # ============================================================
+# INFLATABLE TURNOVER / CLEANING HELPERS
+# ============================================================
+
+def is_inflatable_category_name(name):
+    return classify_item(name) == "inflatables_games"
+
+
+def rental_owned_quantity(rental):
+    if not isinstance(rental, dict):
+        return None
+
+    value = rental.get("quantity")
+
+    try:
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def collect_inflatable_usage(leads):
+    """
+    Returns usage keyed by rental ID.
+
+    Each record contains:
+      name
+      ownedQuantity
+      dates -> booked quantity by event date
+    """
+    usage = {}
+
+    for lead in leads:
+        event_date = lead_event_date(lead)
+        if not event_date:
+            continue
+
+        for row in extract_rentals_from_lead(lead):
+            name = row["name"]
+
+            if not is_inflatable_category_name(name):
+                continue
+
+            rid = row["rental_id"]
+            qty = row["quantity"]
+            rental = row.get("rental", {})
+
+            if rid not in usage:
+                usage[rid] = {
+                    "rentalId": rid,
+                    "name": name,
+                    "ownedQuantity": rental_owned_quantity(rental),
+                    "dates": Counter(),
+                }
+
+            usage[rid]["dates"][str(event_date)] += qty
+
+    return usage
+
+
+async def fetch_future_confirmed_leads(start_date, end_date):
+    """
+    Fetch confirmed future leads with embedded rental data.
+    Kept to a bounded date range to protect the IO API limit.
+    """
+    return await fetch_confirmed_leads(start_date, end_date)
+
+
+async def build_cleaning_plan(start_date, end_date, lookahead_days=60):
+    """
+    Cleaning/turnover plan:
+      - inflatables used on multiple weekend days
+      - definite vs possible turnover
+      - next confirmed use after the weekend
+    """
+    cache_key = f"cleaning:{start_date}:{end_date}:{lookahead_days}"
+    now = time.time()
+
+    cached = _summary_cache.get(cache_key)
+    if cached and now < cached["expires"]:
+        result = dict(cached["data"])
+        result["cache"] = "hit"
+        return result
+
+    weekend_leads = await fetch_confirmed_leads(start_date, end_date)
+    weekend_usage = collect_inflatable_usage(weekend_leads)
+
+    future_start = end_date + timedelta(days=1)
+    future_end = end_date + timedelta(days=lookahead_days)
+
+    future_leads = await fetch_future_confirmed_leads(
+        future_start,
+        future_end
+    )
+
+    future_usage = collect_inflatable_usage(future_leads)
+
+    repeat_this_weekend = []
+    next_use = []
+
+    for rid, record in weekend_usage.items():
+        dates = sorted(record["dates"].keys())
+        owned_qty = record["ownedQuantity"]
+
+        if len(dates) > 1:
+            max_daily_qty = max(record["dates"].values())
+
+            # If IO says only one physical unit is owned, multi-day use is
+            # definitely the same unit turning around between dates.
+            if owned_qty == 1:
+                turnover_type = "definite"
+            else:
+                turnover_type = "possible"
+
+            repeat_this_weekend.append({
+                "rentalId": rid,
+                "name": record["name"],
+                "ownedQuantity": owned_qty,
+                "turnover": turnover_type,
+                "dates": [
+                    {
+                        "date": date_key,
+                        "quantity": record["dates"][date_key]
+                    }
+                    for date_key in dates
+                ],
+                "maxBookedSameDay": max_daily_qty
+            })
+
+        future = future_usage.get(rid)
+
+        if future and future["dates"]:
+            first_future_date = sorted(future["dates"].keys())[0]
+            next_date = first_future_date
+            next_qty = future["dates"][first_future_date]
+        else:
+            next_date = None
+            next_qty = 0
+
+        next_use.append({
+            "rentalId": rid,
+            "name": record["name"],
+            "lastWeekendUse": max(dates) if dates else None,
+            "nextConfirmedUse": next_date,
+            "nextQuantity": next_qty,
+            "lookaheadDays": lookahead_days,
+        })
+
+    repeat_this_weekend.sort(
+        key=lambda x: (
+            0 if x["turnover"] == "definite" else 1,
+            x["name"].lower()
+        )
+    )
+
+    next_use.sort(
+        key=lambda x: (
+            x["nextConfirmedUse"] is None,
+            x["nextConfirmedUse"] or "9999-12-31",
+            x["name"].lower()
+        )
+    )
+
+    result = {
+        "dateRange": {
+            "start": str(start_date),
+            "end": str(end_date)
+        },
+        "status": "confirmed only",
+        "weekendConfirmedLeadCount": len(weekend_leads),
+        "repeatInflatablesThisWeekend": repeat_this_weekend,
+        "nextUseAfterWeekend": next_use,
+        "notes": {
+            "definiteTurnover": (
+                "Inflatable is booked on multiple weekend dates and "
+                "InflatableOffice reports only one unit owned."
+            ),
+            "possibleTurnover": (
+                "Inflatable is booked on multiple weekend dates, but "
+                "InflatableOffice reports multiple units or no owned quantity. "
+                "A specific physical unit assignment cannot be proven from this data."
+            )
+        },
+        "cache": "miss"
+    }
+
+    _summary_cache[cache_key] = {
+        "expires": now + SUMMARY_CACHE_SECONDS,
+        "data": result
+    }
+
+    return result
+
+
+async def build_inflatable_schedule(search_text, start_date, end_date):
+    """
+    Search confirmed inflatable usage by name over a date range.
+    Useful for: 'When is Melting Ice going out next?'
+    """
+    cache_key = (
+        f"inflatableschedule:{normalize_name(search_text)}:"
+        f"{start_date}:{end_date}"
+    )
+    now = time.time()
+
+    cached = _summary_cache.get(cache_key)
+    if cached and now < cached["expires"]:
+        result = dict(cached["data"])
+        result["cache"] = "hit"
+        return result
+
+    leads = await fetch_confirmed_leads(start_date, end_date)
+
+    needle = normalize_name(search_text)
+    matches = defaultdict(Counter)
+    names = {}
+
+    for lead in leads:
+        event_date = lead_event_date(lead)
+        if not event_date:
+            continue
+
+        for row in extract_rentals_from_lead(lead):
+            name = row["name"]
+
+            if not is_inflatable_category_name(name):
+                continue
+
+            if needle not in normalize_name(name):
+                continue
+
+            rid = row["rental_id"]
+            names[rid] = name
+            matches[rid][str(event_date)] += row["quantity"]
+
+    results = []
+
+    for rid, date_counts in matches.items():
+        dates = sorted(date_counts.keys())
+
+        results.append({
+            "rentalId": rid,
+            "name": names[rid],
+            "nextConfirmedUse": dates[0] if dates else None,
+            "bookings": [
+                {
+                    "date": date_key,
+                    "quantity": date_counts[date_key]
+                }
+                for date_key in dates
+            ]
+        })
+
+    results.sort(
+        key=lambda x: (
+            x["nextConfirmedUse"] or "9999-12-31",
+            x["name"].lower()
+        )
+    )
+
+    result = {
+        "search": search_text,
+        "dateRange": {
+            "start": str(start_date),
+            "end": str(end_date)
+        },
+        "status": "confirmed only",
+        "matches": results,
+        "cache": "miss"
+    }
+
+    _summary_cache[cache_key] = {
+        "expires": now + SUMMARY_CACHE_SECONDS,
+        "data": result
+    }
+
+    return result
+
+
+# ============================================================
 # CORE REPORT BUILDER
 # ============================================================
 
@@ -775,7 +1057,7 @@ async def root():
         "service": "Callahan InflatableOffice Bridge",
         "status": "ok",
         "mode": "read-only",
-        "version": "3.0.0"
+        "version": "3.1.0"
     }
 
 
@@ -890,6 +1172,49 @@ async def public_range_loadout(
         )
 
     return await build_loadout(start_date, end_date)
+
+
+@app.get("/public/weekend-cleaning")
+async def public_weekend_cleaning(
+    lookahead_days: int = Query(
+        default=60,
+        ge=7,
+        le=180,
+        description="How many days after the weekend to search for next use"
+    )
+):
+    """
+    Friday-Sunday turnover/cleaning report plus next confirmed use.
+    """
+    today = datetime.now().date()
+    days_until_friday = (4 - today.weekday()) % 7
+    friday = today + timedelta(days=days_until_friday)
+    sunday = friday + timedelta(days=2)
+
+    return await build_cleaning_plan(
+        friday,
+        sunday,
+        lookahead_days=lookahead_days
+    )
+
+
+@app.get("/public/inflatable-next-use")
+async def public_inflatable_next_use(
+    name: str = Query(..., min_length=2, description="Full or partial inflatable name"),
+    days: int = Query(default=90, ge=1, le=365)
+):
+    """
+    Search upcoming confirmed uses of a specific inflatable name.
+    Example: ?name=Melting%20Ice&days=90
+    """
+    start_date = datetime.now().date()
+    end_date = start_date + timedelta(days=days)
+
+    return await build_inflatable_schedule(
+        name,
+        start_date,
+        end_date
+    )
 
 
 @app.post("/admin/clear-cache")
