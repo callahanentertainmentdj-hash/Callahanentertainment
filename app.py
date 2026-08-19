@@ -8,4 +8,4 @@ app.include_router(google_oauth_start_router)
 # Keep the existing InflatableOffice bridge intact and layer Google marketing endpoints on top.
 app.include_router(google_router)
 app.title = "Callahan Entertainment AI Hub"
-app.version = "3.7.0"
+app.version = "3.8.0"
