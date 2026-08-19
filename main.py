@@ -19,7 +19,7 @@ CONFIRMED_STATUS_ID = os.getenv("CONFIRMED_STATUS_ID", "226783").strip()
 
 app = FastAPI(
     title="Callahan InflatableOffice Bridge",
-    version="3.2.0"
+    version="3.3.0"
 )
 
 security = HTTPBearer()
@@ -1148,6 +1148,183 @@ async def build_loadout(start_date, end_date):
     return result
 
 
+
+# ============================================================
+# GENERAL CONFIRMED SCHEDULE SEARCH
+# ============================================================
+
+def lead_customer_name(lead):
+    if not isinstance(lead, dict):
+        return ""
+
+    organization = str(
+        lead.get("eventorganization", "")
+        or ""
+    ).strip()
+
+    cust = lead.get("cust", {})
+    first = ""
+    last = ""
+
+    if isinstance(cust, dict):
+        first = str(cust.get("firstname", "") or "").strip()
+        last = str(cust.get("lastname", "") or "").strip()
+
+    full_name = " ".join(
+        part for part in (first, last) if part
+    ).strip()
+
+    return organization or full_name
+
+
+def lead_address(lead):
+    if not isinstance(lead, dict):
+        return ""
+
+    street = str(lead.get("eventstreet", "") or "").strip()
+    city = str(lead.get("eventcity", "") or "").strip()
+    state = str(lead.get("eventstate", "") or "").strip()
+    zip_code = str(lead.get("eventzip", "") or "").strip()
+
+    # Normalize IO string "null".
+    values = []
+    for value in (street, city, state, zip_code):
+        if value and value.lower() != "null":
+            values.append(value)
+
+    if not values:
+        return ""
+
+    if street and street.lower() != "null":
+        city_state_zip = " ".join(
+            x for x in (city, state, zip_code)
+            if x and x.lower() != "null"
+        ).strip()
+        return f"{street}, {city_state_zip}" if city_state_zip else street
+
+    return " ".join(values)
+
+
+def lead_start_datetime(lead):
+    value = lead.get("eventstarttime") if isinstance(lead, dict) else None
+
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+    except Exception:
+        return None
+
+
+def lead_end_datetime(lead):
+    value = lead.get("eventendtime") if isinstance(lead, dict) else None
+
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+    except Exception:
+        return None
+
+
+def format_clock(dt):
+    if not dt:
+        return None
+
+    # %-I isn't portable to Windows, so format then strip.
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+
+async def build_schedule_search(
+    search_text,
+    start_date,
+    end_date,
+):
+    """
+    Search confirmed bookings by rental/item name substring.
+    Returns event-level schedule rows with date/time, qty and address.
+    """
+    cache_key = (
+        f"schedule:{normalize_name(search_text)}:"
+        f"{start_date}:{end_date}"
+    )
+    now = time.time()
+
+    cached = _summary_cache.get(cache_key)
+    if cached and now < cached["expires"]:
+        result = dict(cached["data"])
+        result["cache"] = "hit"
+        return result
+
+    leads = await fetch_confirmed_leads(
+        start_date,
+        end_date
+    )
+
+    needle = normalize_name(search_text)
+    rows = []
+
+    for lead in leads:
+        start_dt = lead_start_datetime(lead)
+        end_dt = lead_end_datetime(lead)
+
+        for rental_row in extract_rentals_from_lead(lead):
+            rental_name = rental_row["name"]
+
+            if needle not in normalize_name(rental_name):
+                continue
+
+            rows.append({
+                "leadId": str(lead.get("id", "")),
+                "date": (
+                    str(start_dt.date())
+                    if start_dt
+                    else str(lead_event_date(lead) or "")
+                ),
+                "startTime": format_clock(start_dt),
+                "endTime": format_clock(end_dt),
+                "rentalName": rental_name,
+                "quantity": rental_row["quantity"],
+                "customer": lead_customer_name(lead),
+                "address": lead_address(lead),
+                "deliveryType": str(
+                    lead.get("deliverytype", "") or ""
+                ).strip(),
+            })
+
+    rows.sort(
+        key=lambda x: (
+            x["date"],
+            x["startTime"] or "",
+            x["rentalName"].lower(),
+        )
+    )
+
+    result = {
+        "search": search_text,
+        "dateRange": {
+            "start": str(start_date),
+            "end": str(end_date),
+        },
+        "status": "confirmed only",
+        "count": len(rows),
+        "bookings": rows,
+        "cache": "miss",
+    }
+
+    _summary_cache[cache_key] = {
+        "expires": now + SUMMARY_CACHE_SECONDS,
+        "data": result,
+    }
+
+    return result
+
 # ============================================================
 # ROUTES
 # ============================================================
@@ -1158,7 +1335,7 @@ async def root():
         "service": "Callahan InflatableOffice Bridge",
         "status": "ok",
         "mode": "read-only",
-        "version": "3.2.0"
+        "version": "3.3.0"
     }
 
 
@@ -1313,6 +1490,70 @@ async def public_inflatable_next_use(
 
     return await build_inflatable_schedule(
         name,
+        start_date,
+        end_date
+    )
+
+
+@app.get("/public/schedule")
+async def public_schedule(
+    q: str = Query(
+        ...,
+        min_length=2,
+        description="Rental/item search text, e.g. Foam, Tent, Melting Ice"
+    ),
+    days: int = Query(
+        default=14,
+        ge=1,
+        le=180,
+        description="Number of days from today"
+    )
+):
+    """
+    Confirmed schedule search from today forward.
+    Example:
+      /public/schedule?q=Foam&days=14
+    """
+    start_date = datetime.now().date()
+    end_date = start_date + timedelta(days=days)
+
+    return await build_schedule_search(
+        q,
+        start_date,
+        end_date
+    )
+
+
+@app.get("/public/schedule-range")
+async def public_schedule_range(
+    q: str = Query(
+        ...,
+        min_length=2,
+        description="Rental/item search text"
+    ),
+    start: str = Query(..., description="YYYY-MM-DD"),
+    end: str = Query(..., description="YYYY-MM-DD"),
+):
+    """
+    Confirmed schedule search over an explicit date range.
+    """
+    start_date = parse_requested_date(start)
+    end_date = parse_requested_date(end)
+
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="End date must be on or after start date"
+        )
+
+    if (end_date - start_date).days > 180:
+        raise HTTPException(
+            status_code=400,
+            detail="Schedule range is limited to 180 days"
+        )
+
+    return await build_schedule_search(
+        q,
         start_date,
         end_date
     )
