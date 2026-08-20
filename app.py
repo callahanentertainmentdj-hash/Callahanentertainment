@@ -9,3 +9,8 @@ app.include_router(google_oauth_start_router)
 app.include_router(google_router)
 app.title = "Callahan Entertainment AI Hub"
 app.version = "3.8.0"
+
+# GPT Actions requires an explicit absolute server URL in the OpenAPI schema.
+app.servers = [{"url": "https://callahanentertainment.onrender.com"}]
+app.openapi_schema = None
+
