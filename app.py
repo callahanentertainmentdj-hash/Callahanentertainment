@@ -29,3 +29,19 @@ async def operations_openapi_schema():
         "title": "Callahan Entertainment Operations and Inventory",
     }
     return schema
+
+@app.get("/openapi-google.json", include_in_schema=False)
+async def google_openapi_schema():
+    """GPT Actions schema limited to protected Google marketing operations."""
+    schema = dict(app.openapi())
+    schema["servers"] = [{"url": "https://callahanentertainment.onrender.com"}]
+    schema["paths"] = {
+        path: operations
+        for path, operations in schema.get("paths", {}).items()
+        if path.startswith("/google/") and not path.startswith("/google/oauth/")
+    }
+    schema["info"] = {
+        **schema.get("info", {}),
+        "title": "Callahan Entertainment Google Marketing",
+    }
+    return schema
