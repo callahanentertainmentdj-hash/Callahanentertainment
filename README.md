@@ -23,6 +23,10 @@ Important operational endpoints include:
 - `GET /leads`
 - `GET /leads/{lead_id}`
 - `GET /rentals`
+- `GET /inventory?category=inflatables&history_days=90&future_days=90`
+- `GET /inventory/idle?category=concessions&min_idle_days=30`
+- `GET /inventory/categories?history_days=90&future_days=90`
+- `GET /inventory/item?name=Melting%20Ice&history_days=180&future_days=180`
 - `GET /status-events`
 - `GET /status-summary`
 - `GET /weekend-collections`
