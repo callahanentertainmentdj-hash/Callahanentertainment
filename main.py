@@ -36,7 +36,8 @@ except ValueError:
 
 app = FastAPI(
     title="Callahan InflatableOffice Bridge",
-    version="3.5.0"
+    version="3.5.0",
+    servers=[{"url": "https://callahanentertainment.onrender.com"}],
 )
 
 security = HTTPBearer()
