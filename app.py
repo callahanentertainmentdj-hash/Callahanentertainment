@@ -45,3 +45,51 @@ async def google_openapi_schema():
         "title": "Callahan Entertainment Google Marketing",
     }
     return schema
+
+@app.get("/openapi-combined.json", include_in_schema=False)
+async def combined_openapi_schema():
+    """One GPT Actions schema combining operations and Google marketing."""
+    selected_paths = {
+        "/health",
+        "/rentals",
+        "/inventory",
+        "/inventory/idle",
+        "/inventory/categories",
+        "/inventory/item",
+        "/status-events",
+        "/status-summary",
+        "/weekend-collections",
+        "/collections-range",
+        "/staffing",
+        "/staffing-range",
+        "/weekend-operations",
+        "/public/weekend-loadout",
+        "/public/day-loadout",
+        "/public/range-loadout",
+        "/public/weekend-cleaning",
+        "/public/inflatable-next-use",
+        "/public/schedule",
+        "/google/status",
+        "/google/search-console/performance",
+        "/google/search-console/summary",
+        "/google/search-console/opportunities",
+        "/google/analytics/report",
+        "/google/analytics/overview",
+        "/google/ads/campaigns",
+        "/google/ads/search-terms",
+        "/google/ads/keywords",
+        "/google/reviews",
+        "/google/marketing-summary",
+    }
+    schema = dict(app.openapi())
+    schema["servers"] = [{"url": "https://callahanentertainment.onrender.com"}]
+    schema["paths"] = {
+        path: operations
+        for path, operations in schema.get("paths", {}).items()
+        if path in selected_paths
+    }
+    schema["info"] = {
+        **schema.get("info", {}),
+        "title": "Callahan Entertainment Operations and Google Marketing",
+    }
+    return schema
