@@ -1016,6 +1016,129 @@ async def fetch_confirmed_leads(start_date, end_date):
     return await fetch_leads_by_status(start_date, end_date, ["confirmed"])
 
 
+def rental_catalog_id(rental):
+    """Normalize the different identifier fields returned by IO rentals."""
+    for key in ("id", "rentalid", "rental_id", "rideid", "ride_id"):
+        value = rental.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def rental_is_active(rental):
+    for key in ("active", "enabled", "isactive", "is_active"):
+        if key in rental:
+            return str(rental[key]).strip().lower() not in {"0", "false", "no", "off"}
+    for key in ("inactive", "disabled", "deleted", "archived"):
+        if key in rental:
+            return str(rental[key]).strip().lower() in {"0", "false", "no", "off", ""}
+    return True
+
+
+def inventory_category_matches(item, requested):
+    if not requested:
+        return True
+    needle = normalize_name(requested).replace("-", " ").replace("_", " ")
+    candidates = (
+        item["category"].replace("_", " "),
+        item["categoryLabel"],
+        item.get("sourceCategory") or "",
+    )
+    return any(needle in normalize_name(candidate) for candidate in candidates)
+
+
+async def build_inventory_activity(history_days=90, future_days=90):
+    """Join the complete rental catalog with bounded historical/future events."""
+    cache_key = f"inventoryactivity:{history_days}:{future_days}"
+    now = time.time()
+    cached = _summary_cache.get(cache_key)
+    if cached and now < cached["expires"]:
+        result = dict(cached["data"])
+        result["cache"] = "hit"
+        return result
+
+    today = datetime.now().date()
+    history_start = today - timedelta(days=history_days)
+    future_end = today + timedelta(days=future_days)
+
+    catalog = await io_get_pages("rentals", {"_body": "true"}, max_pages=10)
+    # Completed events establish actual historical use; confirmed/contracted
+    # events cover accounts where past bookings retain their original status.
+    leads = await fetch_leads_by_status(
+        history_start, future_end, ["complete", "confirmed", "contracted"]
+    )
+
+    usage = defaultdict(list)
+    names_from_events = {}
+    for lead in leads:
+        event_date = lead_event_date(lead)
+        if not event_date:
+            continue
+        for row in extract_rentals_from_lead(lead):
+            rental_id = str(row["rental_id"])
+            names_from_events[rental_id] = row["name"]
+            usage[rental_id].append({
+                "date": str(event_date),
+                "quantity": row["quantity"],
+                "status": lead_status_name(lead),
+                "eventId": lead.get("id"),
+            })
+
+    items = []
+    catalog_ids = set()
+    for rental in catalog:
+        if not isinstance(rental, dict):
+            continue
+        rental_id = rental_catalog_id(rental)
+        if not rental_id:
+            continue
+        catalog_ids.add(rental_id)
+        name = rental_name_from_object(rental, rental_id)
+        if name == f"Rental {rental_id}":
+            name = names_from_events.get(rental_id, name)
+        category = classify_item(name)
+        source_category = rental.get("category") or rental.get("categoryname") or rental.get("category_name")
+        if isinstance(source_category, dict):
+            source_category = source_category.get("name") or source_category.get("title")
+        bookings = sorted(usage.get(rental_id, []), key=lambda booking: booking["date"])
+        past = [booking for booking in bookings if booking["date"] < str(today)]
+        upcoming = [booking for booking in bookings if booking["date"] >= str(today)]
+        last_date = past[-1]["date"] if past else None
+        next_date = upcoming[0]["date"] if upcoming else None
+        items.append({
+            "rentalId": rental_id,
+            "name": name,
+            "category": category,
+            "categoryLabel": CATEGORY_LABELS.get(category, category),
+            "sourceCategory": source_category,
+            "ownedQuantity": rental_owned_quantity(rental),
+            "active": rental_is_active(rental),
+            "lastRentalDate": last_date,
+            "nextRentalDate": next_date,
+            "daysSinceLastRental": (today - datetime.strptime(last_date, "%Y-%m-%d").date()).days if last_date else None,
+            "daysUntilNextRental": (datetime.strptime(next_date, "%Y-%m-%d").date() - today).days if next_date else None,
+            "pastBookingCount": len(past),
+            "upcomingBookingCount": len(upcoming),
+            "pastBookings": past,
+            "upcomingBookings": upcoming,
+        })
+
+    items.sort(key=lambda item: (item["categoryLabel"].lower(), item["name"].lower()))
+    result = {
+        "asOf": str(today),
+        "historyStart": str(history_start),
+        "futureEnd": str(future_end),
+        "inventoryCount": len(items),
+        "activeInventoryCount": sum(1 for item in items if item["active"]),
+        "unbookedInventoryCount": sum(1 for item in items if item["active"] and not item["upcomingBookingCount"]),
+        "eventItemsMissingFromCatalog": sorted(set(usage) - catalog_ids),
+        "items": items,
+        "cache": "miss",
+    }
+    _summary_cache[cache_key] = {"expires": now + SUMMARY_CACHE_SECONDS, "data": result}
+    return result
+
+
 async def build_loadout(start_date, end_date):
     cache_key = f"loadout:{start_date}:{end_date}"
     now = time.time()
@@ -2065,6 +2188,103 @@ async def rentals(
             "limit": limit
         }
     )
+
+
+@app.get("/inventory")
+async def inventory_overview(
+    category: Optional[str] = Query(default=None, description="Category name, such as tents, concessions, or inflatables"),
+    q: Optional[str] = Query(default=None, description="Full or partial inventory item name"),
+    history_days: int = Query(default=90, ge=1, le=365),
+    future_days: int = Query(default=90, ge=1, le=365),
+    include_inactive: bool = Query(default=False),
+    _: bool = Depends(check_token),
+):
+    """Complete inventory with previous rentals and upcoming reservations."""
+    report = await build_inventory_activity(history_days, future_days)
+    needle = normalize_name(q) if q else None
+    items = [
+        item for item in report["items"]
+        if (include_inactive or item["active"])
+        and inventory_category_matches(item, category)
+        and (not needle or needle in normalize_name(item["name"]))
+    ]
+    return {**report, "filters": {"category": category, "q": q}, "count": len(items), "items": items}
+
+
+@app.get("/inventory/idle")
+async def inventory_idle(
+    category: Optional[str] = Query(default=None),
+    min_idle_days: int = Query(default=0, ge=0, le=365),
+    history_days: int = Query(default=90, ge=1, le=365),
+    future_days: int = Query(default=90, ge=1, le=365),
+    _: bool = Depends(check_token),
+):
+    """Active equipment without any reservation inside the upcoming window."""
+    report = await build_inventory_activity(history_days, future_days)
+    items = [
+        item for item in report["items"]
+        if item["active"]
+        and item["upcomingBookingCount"] == 0
+        and inventory_category_matches(item, category)
+        and (item["daysSinceLastRental"] is None or item["daysSinceLastRental"] >= min_idle_days)
+    ]
+    items.sort(key=lambda item: (item["daysSinceLastRental"] is not None, -(item["daysSinceLastRental"] or 0), item["name"].lower()))
+    return {
+        "asOf": report["asOf"], "historyStart": report["historyStart"],
+        "futureEnd": report["futureEnd"], "category": category,
+        "minIdleDays": min_idle_days, "count": len(items), "items": items,
+        "cache": report["cache"],
+    }
+
+
+@app.get("/inventory/categories")
+async def inventory_category_summary(
+    history_days: int = Query(default=90, ge=1, le=365),
+    future_days: int = Query(default=90, ge=1, le=365),
+    _: bool = Depends(check_token),
+):
+    """Inventory, booking activity, and idle equipment grouped by category."""
+    report = await build_inventory_activity(history_days, future_days)
+    groups = {}
+    for item in report["items"]:
+        if not item["active"]:
+            continue
+        group = groups.setdefault(item["category"], {
+            "category": item["category"], "label": item["categoryLabel"],
+            "itemCount": 0, "ownedQuantity": 0, "pastBookingCount": 0,
+            "upcomingBookingCount": 0, "unbookedItemCount": 0, "unbookedItems": [],
+        })
+        group["itemCount"] += 1
+        group["ownedQuantity"] += item["ownedQuantity"] or 0
+        group["pastBookingCount"] += item["pastBookingCount"]
+        group["upcomingBookingCount"] += item["upcomingBookingCount"]
+        if not item["upcomingBookingCount"]:
+            group["unbookedItemCount"] += 1
+            group["unbookedItems"].append(item["name"])
+    categories = sorted(groups.values(), key=lambda group: group["label"].lower())
+    return {
+        "asOf": report["asOf"], "historyStart": report["historyStart"],
+        "futureEnd": report["futureEnd"], "categoryCount": len(categories),
+        "categories": categories, "cache": report["cache"],
+    }
+
+
+@app.get("/inventory/item")
+async def inventory_item_history(
+    name: str = Query(..., min_length=2, description="Full or partial equipment name"),
+    history_days: int = Query(default=180, ge=1, le=365),
+    future_days: int = Query(default=180, ge=1, le=365),
+    _: bool = Depends(check_token),
+):
+    """Last use, next use, and all matching past/future equipment bookings."""
+    report = await build_inventory_activity(history_days, future_days)
+    needle = normalize_name(name)
+    matches = [item for item in report["items"] if needle in normalize_name(item["name"])]
+    return {
+        "search": name, "asOf": report["asOf"], "historyStart": report["historyStart"],
+        "futureEnd": report["futureEnd"], "count": len(matches), "items": matches,
+        "cache": report["cache"],
+    }
 
 
 @app.get("/status-events")
