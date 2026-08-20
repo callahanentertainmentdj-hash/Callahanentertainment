@@ -14,3 +14,18 @@ app.version = "3.8.0"
 app.servers = [{"url": "https://callahanentertainment.onrender.com"}]
 app.openapi_schema = None
 
+@app.get("/openapi-operations.json", include_in_schema=False)
+async def operations_openapi_schema():
+    """GPT Actions schema limited to InflatableOffice operations and inventory."""
+    schema = dict(app.openapi())
+    schema["servers"] = [{"url": "https://callahanentertainment.onrender.com"}]
+    schema["paths"] = {
+        path: operations
+        for path, operations in schema.get("paths", {}).items()
+        if path != "/" and not path.startswith(("/google/", "/admin/"))
+    }
+    schema["info"] = {
+        **schema.get("info", {}),
+        "title": "Callahan Entertainment Operations and Inventory",
+    }
+    return schema
