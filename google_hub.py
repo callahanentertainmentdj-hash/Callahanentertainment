@@ -13,7 +13,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-
+class ReviewReplyRequest(BaseModel):
+    comment: str = Field(..., min_length=1, max_length=4096)
 router = APIRouter(prefix="/google", tags=["Google AI Hub"])
 security = HTTPBearer()
 
@@ -515,7 +516,7 @@ async def _ads_search(
 # -------------------------------------------------------------------
 
 
-@router.get(
+@.get(
     "/oauth/callback",
     response_class=HTMLResponse,
 )
@@ -578,7 +579,7 @@ async def google_oauth_callback(
 # -------------------------------------------------------------------
 
 
-@router.get("/status")
+@.get("/status")
 async def google_status(
     _: bool = Depends(_check_bridge_token),
 ):
@@ -629,7 +630,7 @@ async def google_status(
 # -------------------------------------------------------------------
 
 
-@router.get("/search-console/sites")
+@.get("/search-console/sites")
 async def search_console_sites(
     _: bool = Depends(_check_bridge_token),
 ):
@@ -639,7 +640,7 @@ async def search_console_sites(
     )
 
 
-@router.get("/search-console/performance")
+@.get("/search-console/performance")
 async def search_console_performance(
     days: int = Query(
         default=28,
@@ -708,7 +709,7 @@ async def search_console_performance(
     )
 
 
-@router.get("/search-console/summary")
+@.get("/search-console/summary")
 async def search_console_summary(
     days: int = Query(
         default=28,
@@ -778,7 +779,7 @@ async def search_console_summary(
     }
 
 
-@router.get("/search-console/opportunities")
+@.get("/search-console/opportunities")
 async def search_console_opportunities(
     days: int = Query(
         default=28,
@@ -972,7 +973,7 @@ async def search_console_opportunities(
 # -------------------------------------------------------------------
 
 
-@router.get("/analytics/report")
+@.get("/analytics/report")
 async def analytics_report(
     days: int = Query(
         default=28,
@@ -1043,7 +1044,7 @@ async def analytics_report(
     )
 
 
-@router.get("/analytics/overview")
+@.get("/analytics/overview")
 async def analytics_overview(
     days: int = Query(
         default=28,
@@ -1137,7 +1138,7 @@ async def analytics_overview(
 # -------------------------------------------------------------------
 
 
-@router.get("/ads/customers")
+@.get("/ads/customers")
 async def ads_customers(
     _: bool = Depends(_check_bridge_token),
 ):
@@ -1173,7 +1174,7 @@ async def ads_customers(
     return response.json()
 
 
-@router.get("/ads/campaigns")
+@.get("/ads/campaigns")
 async def ads_campaigns(
     days: int = Query(
         default=28,
@@ -1212,7 +1213,7 @@ async def ads_campaigns(
     )
 
 
-@router.get("/ads/search-terms")
+@.get("/ads/search-terms")
 async def ads_search_terms(
     days: int = Query(
         default=28,
@@ -1254,7 +1255,7 @@ async def ads_search_terms(
     )
 
 
-@router.get("/ads/keywords")
+@.get("/ads/keywords")
 async def ads_keywords(
     days: int = Query(
         default=28,
@@ -1303,7 +1304,7 @@ async def ads_keywords(
 # -------------------------------------------------------------------
 
 
-@router.get("/business/accounts")
+@.get("/business/accounts")
 async def business_accounts(
     _: bool = Depends(_check_bridge_token),
 ):
@@ -1316,7 +1317,7 @@ async def business_accounts(
     )
 
 
-@router.get("/business/locations")
+@.get("/business/locations")
 async def business_locations(
     account_id: Optional[str] = Query(
         default=None
@@ -1357,7 +1358,7 @@ async def business_locations(
 # -------------------------------------------------------------------
 
 
-@router.get(
+@.get(
     "/reviews",
     summary="Get Google Business Profile reviews",
 )
@@ -1434,81 +1435,37 @@ class ReviewReplyRequest(BaseModel):
 
 @router.put(
     "/reviews/{review_id}/reply",
-    summary=(
-        "Reply to a Google Business Profile review"
-    ),
-    description=(
-        "Publishes or updates Callahan Entertainment's "
-        "public owner reply to a Google Business Profile "
-        "review. This is a write action and requires the "
-        "Callahan bridge authorization token."
-    ),
+    summary="Reply to a Google Business Profile review",
+    description="Publishes or updates Callahan Entertainment's owner reply to a Google review",
 )
 async def reply_to_business_review(
     review_id: str,
     body: ReviewReplyRequest,
-    account_id: Optional[str] = Query(
-        default=None
-    ),
-    location_id: Optional[str] = Query(
-        default=None
-    ),
+    account_id: Optional[str] = Query(default=None),
+    location_id: Optional[str] = Query(default=None),
     _: bool = Depends(_check_bridge_token),
 ):
-    aid = (
-        account_id
-        or GOOGLE_BUSINESS_ACCOUNT_ID
-    ).replace(
-        "accounts/",
-        "",
-    ).strip()
-
-    lid = (
-        location_id
-        or GOOGLE_BUSINESS_LOCATION_ID
-    ).replace(
-        "locations/",
-        "",
-    ).strip()
+    aid = (account_id or GOOGLE_BUSINESS_ACCOUNT_ID).replace("accounts/", "").strip()
+    lid = (location_id or GOOGLE_BUSINESS_LOCATION_ID).replace("locations/", "").strip()
 
     if not aid or not lid:
         raise HTTPException(
-            status_code=503,
-            detail=(
-                "GOOGLE_BUSINESS_ACCOUNT_ID and "
-                "GOOGLE_BUSINESS_LOCATION_ID "
-                "must be configured"
-            ),
+            503,
+            detail="GOOGLE_BUSINESS_ACCOUNT_ID and GOOGLE_BUSINESS_LOCATION_ID must be configured",
         )
 
     review_id = review_id.strip()
-
     if not review_id:
-        raise HTTPException(
-            status_code=400,
-            detail="review_id is required",
-        )
+        raise HTTPException(400, detail="review_id is required")
 
     comment = body.comment.strip()
-
     if not comment:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Reply comment cannot be empty"
-            ),
-        )
+        raise HTTPException(400, detail="Reply comment cannot be empty")
 
     return await _google_request(
         "PUT",
-        (
-            "https://mybusiness.googleapis.com/"
-            f"v4/accounts/{aid}/locations/"
-            f"{lid}/reviews/{review_id}/reply"
-        ),
-        json={
-            "comment": comment
-        },
+        f"https://mybusiness.googleapis.com/v4/accounts/{aid}/locations/{lid}/reviews/{review_id}/reply",
+        json={"comment": comment},
     )
 
 
