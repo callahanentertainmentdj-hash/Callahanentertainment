@@ -579,7 +579,7 @@ async def google_oauth_callback(
 # -------------------------------------------------------------------
 
 
-@.get("/status")
+@router.get("/status")
 async def google_status(
     _: bool = Depends(_check_bridge_token),
 ):
@@ -630,7 +630,7 @@ async def google_status(
 # -------------------------------------------------------------------
 
 
-@.get("/search-console/sites")
+@router.get("/search-console/sites")
 async def search_console_sites(
     _: bool = Depends(_check_bridge_token),
 ):
@@ -640,7 +640,7 @@ async def search_console_sites(
     )
 
 
-@.get("/search-console/performance")
+@router.get("/search-console/performance")
 async def search_console_performance(
     days: int = Query(
         default=28,
@@ -709,7 +709,7 @@ async def search_console_performance(
     )
 
 
-@.get("/search-console/summary")
+@router.get("/search-console/summary")
 async def search_console_summary(
     days: int = Query(
         default=28,
@@ -779,7 +779,7 @@ async def search_console_summary(
     }
 
 
-@.get("/search-console/opportunities")
+@router.get("/search-console/opportunities")
 async def search_console_opportunities(
     days: int = Query(
         default=28,
@@ -973,7 +973,7 @@ async def search_console_opportunities(
 # -------------------------------------------------------------------
 
 
-@.get("/analytics/report")
+@router.get("/analytics/report")
 async def analytics_report(
     days: int = Query(
         default=28,
@@ -1044,7 +1044,7 @@ async def analytics_report(
     )
 
 
-@.get("/analytics/overview")
+@router.get("/analytics/overview")
 async def analytics_overview(
     days: int = Query(
         default=28,
@@ -1138,7 +1138,7 @@ async def analytics_overview(
 # -------------------------------------------------------------------
 
 
-@.get("/ads/customers")
+@router.get("/ads/customers")
 async def ads_customers(
     _: bool = Depends(_check_bridge_token),
 ):
@@ -1174,7 +1174,7 @@ async def ads_customers(
     return response.json()
 
 
-@.get("/ads/campaigns")
+@router.get("/ads/campaigns")
 async def ads_campaigns(
     days: int = Query(
         default=28,
@@ -1213,7 +1213,7 @@ async def ads_campaigns(
     )
 
 
-@.get("/ads/search-terms")
+@router.get("/ads/search-terms")
 async def ads_search_terms(
     days: int = Query(
         default=28,
@@ -1255,7 +1255,7 @@ async def ads_search_terms(
     )
 
 
-@.get("/ads/keywords")
+@router.get("/ads/keywords")
 async def ads_keywords(
     days: int = Query(
         default=28,
@@ -1304,7 +1304,7 @@ async def ads_keywords(
 # -------------------------------------------------------------------
 
 
-@.get("/business/accounts")
+@router.get("/business/accounts")
 async def business_accounts(
     _: bool = Depends(_check_bridge_token),
 ):
@@ -1317,7 +1317,7 @@ async def business_accounts(
     )
 
 
-@.get("/business/locations")
+@router.get("/business/locations")
 async def business_locations(
     account_id: Optional[str] = Query(
         default=None
@@ -1358,7 +1358,7 @@ async def business_locations(
 # -------------------------------------------------------------------
 
 
-@.get(
+@router.get(
     "/reviews",
     summary="Get Google Business Profile reviews",
 )
