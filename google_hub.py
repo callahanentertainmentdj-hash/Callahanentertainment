@@ -516,7 +516,7 @@ async def _ads_search(
 # -------------------------------------------------------------------
 
 
-@.get(
+@router.get(
     "/oauth/callback",
     response_class=HTMLResponse,
 )
